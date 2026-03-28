@@ -1,9 +1,50 @@
+<!DOCTYPE html>
 <html>
-  <head>
-    <title>Video</title>
-  </head>
-  <body>
-    <h1>Video</h1>
-    <img src="{{ url_for('video_feed') }}">
-  </body>
+<head>
+  <title>Cavepaint</title>
+  <style>
+    body   { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; }
+    video  { display: block; max-width: 100%; }
+    button { margin: 12px; padding: 10px 28px; font-size: 1rem; background: #c0392b; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #e74c3c; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <button onclick="fetch('/clear', {method:'POST'})">Clear Canvas</button>
+  <script>
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.ontrack = (event) => {
+      document.getElementById('video').srcObject = event.streams[0];
+    };
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    async function start() {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering before sending offer
+      await new Promise(resolve => {
+        if (pc.iceGatheringState === 'complete') { resolve(); return; }
+        pc.addEventListener('icegatheringstatechange', () => {
+          if (pc.iceGatheringState === 'complete') resolve();
+        });
+      });
+
+      const resp = await fetch('/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      const answer = await resp.json();
+      await pc.setRemoteDescription(answer);
+    }
+
+    start();
+  </script>
+</body>
 </html>
