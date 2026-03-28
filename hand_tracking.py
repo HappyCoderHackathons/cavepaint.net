@@ -7,6 +7,8 @@ HAND_MODEL_PATH = Path("hand_landmarker.task")
 INDEX_FINGERTIP = 8
 points = []
 current_speed = 0.0
+canvas = None
+last_radius = 8
 
 
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -14,43 +16,45 @@ HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 BaseOptions = mp.tasks.BaseOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-def get_speed(points):
-    if len(points) < 2:
-        return 0.0
-    return float(np.linalg.norm(np.array(points[-1]) - np.array(points[-2])))
-
-def draw_point(frame, landmarks, w, h): 
-    lm = landmarks[INDEX_FINGERTIP]
+def draw_latest_segment(frame_shape):
+    global canvas, last_radius
+    if canvas is None:
+        canvas = np.zeros(frame_shape, dtype=np.uint8)
 
     if len(points) < 2:
-        """Early return if not enough points"""
         return
-    
-    radii = infer_pressure_from_speed(points, min_radius=4, max_radius=12)
-    for center, radius in zip(points, radii):
-        cv2.circle(frame, center=center, radius=radius, color=(255, 0, 0), thickness=-1)
 
-def infer_pressure_from_speed(points, min_radius=2, max_radius=12):
-    """
-    Fast movement  →  low pressure  →  thin stroke
-    Slow movement  →  high pressure →  thick stroke
-    """
-    if len(points) < 2:
-        return [max_radius] * len(points)
- 
-    pts = np.array(points, dtype=float)
-    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)   # segment lengths
-    diffs = np.append(diffs, diffs[-1])                     # match length
- 
-    # Smooth the speed signal to avoid jitter
-    kernel_size = max(3, len(diffs) // 10) | 1              # must be odd
-    speed_smooth = np.convolve(diffs, np.ones(kernel_size) / kernel_size, mode='same')
- 
-    # Invert: high speed → low radius
-    speed_norm = (speed_smooth - speed_smooth.min()) / (speed_smooth.max() - speed_smooth.min() + 1e-9)
-    radii = max_radius - speed_norm * (max_radius - min_radius)
-    print(radii)
-    return radii.astype(int).tolist()
+    p1, p2 = np.array(points[-2]), np.array(points[-1])
+    direction = p2 - p1
+    length = np.linalg.norm(direction)
+
+    steps = max(1, int(length / 10))  # one sub-segment per 10px
+    for i in range(steps):
+        t1 = i / steps
+        t2 = (i + 1) / steps
+        sp1 = (p1 + direction * t1).astype(int)
+        sp2 = (p1 + direction * t2).astype(int)
+        seg = sp2 - sp1
+        seg_len = np.linalg.norm(seg)
+        if seg_len == 0:
+            continue
+
+    # Radius from speed, clamped so it can't change too abruptly
+    speed_norm = min(length / 40.0, 1.0)
+    target_radius = int(12 - speed_norm * (12 - 4))
+    r = int(last_radius * 0.6 + target_radius * 0.4)  # smooth transition
+    last_radius = r
+
+
+    perp = np.array([-direction[1], direction[0]]) / length
+    quad = np.array([
+        p1 + perp * r, p1 - perp * r,
+        p2 - perp * r, p2 + perp * r,
+    ], dtype=np.int32).reshape((-1, 1, 2))
+
+    cv2.fillPoly(canvas, [quad], (255, 0, 0))
+    cv2.circle(canvas, tuple(p1), r, (255, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(canvas, tuple(p2), r, (255, 0, 0), -1, cv2.LINE_AA)
 
 
 def get_fingertip(landmarks, w, h):
@@ -69,7 +73,7 @@ def draw_hand(frame, landmarks, w, h):
 
 
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     if not cap.isOpened():
         print("Error: cannot open camera")
         return
@@ -108,9 +112,14 @@ def main():
 
                 fx, fy = get_fingertip(landmarks, w, h)
                 points.append((fx, fy))
-                draw_point(frame, landmarks, w, h)
+                draw_latest_segment(frame.shape)
 
-                current_speed = get_speed(points)
+                # Composite canvas onto live frame
+                output = frame.copy()
+                mask = canvas.any(axis=2)
+                output[mask] = canvas[mask]
+                cv2.imshow("Hand Tracking", output)
+
 
                 cv2.circle(frame, (fx, fy), 10, (0, 255, 255), -1)
                 cv2.putText(
@@ -125,8 +134,9 @@ def main():
                 )
             else:
                 points.clear()
+                cv2.imshow("Hand Tracking", frame)
 
-            cv2.imshow("Hand Tracking", frame)
+            #cv2.imshow("Hand Tracking", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 

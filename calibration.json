@@ -1,0 +1,33 @@
+{
+  "cam1": {
+    "focal_length_px": 837.04,
+    "measured_at": {
+      "px_width": 113,
+      "real_width_in": 3.24,
+      "distance_in": 24.0
+    },
+    "toein_angle_deg": 13.373,
+    "toein_measured_at": {
+      "offset_px": 199.0,
+      "distance_in": 27.6,
+      "focal_px": 837.04
+    }
+  },
+  "cam2": {
+    "focal_length_px": 777.78,
+    "measured_at": {
+      "px_width": 105,
+      "real_width_in": 3.24,
+      "distance_in": 24.0
+    },
+    "toein_angle_deg": -11.412,
+    "toein_measured_at": {
+      "offset_px": -157.0,
+      "distance_in": 27.6,
+      "focal_px": 777.78
+    }
+  },
+  "focal_length_avg_px": 807.41,
+  "convergence_inches": 13.98,
+  "toein_angle_deg": 23.23
+}
