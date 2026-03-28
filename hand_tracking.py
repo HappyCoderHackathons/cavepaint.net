@@ -1,22 +1,56 @@
 import cv2
 import mediapipe as mp
 from pathlib import Path
+import numpy as np
 
 HAND_MODEL_PATH = Path("hand_landmarker.task")
 INDEX_FINGERTIP = 8
 points = []
+current_speed = 0.0
+
 
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 BaseOptions = mp.tasks.BaseOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-def draw_point(frame, landmarks, w, h):
-    lm = landmarks[INDEX_FINGERTIP]
-    points.append((int(lm.x * w), int(lm.y * h)))
-    for center in points:
-        cv2.circle(frame, center = center, radius = 5,color = (255, 255, 0),thickness=5)
+def get_speed(points):
+    if len(points) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.array(points[-1]) - np.array(points[-2])))
 
+def draw_point(frame, landmarks, w, h): 
+    lm = landmarks[INDEX_FINGERTIP]
+
+    if len(points) < 2:
+        """Early return if not enough points"""
+        return
+    
+    radii = infer_pressure_from_speed(points, min_radius=4, max_radius=12)
+    for center, radius in zip(points, radii):
+        cv2.circle(frame, center=center, radius=radius, color=(255, 0, 0), thickness=-1)
+
+def infer_pressure_from_speed(points, min_radius=2, max_radius=12):
+    """
+    Fast movement  →  low pressure  →  thin stroke
+    Slow movement  →  high pressure →  thick stroke
+    """
+    if len(points) < 2:
+        return [max_radius] * len(points)
+ 
+    pts = np.array(points, dtype=float)
+    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)   # segment lengths
+    diffs = np.append(diffs, diffs[-1])                     # match length
+ 
+    # Smooth the speed signal to avoid jitter
+    kernel_size = max(3, len(diffs) // 10) | 1              # must be odd
+    speed_smooth = np.convolve(diffs, np.ones(kernel_size) / kernel_size, mode='same')
+ 
+    # Invert: high speed → low radius
+    speed_norm = (speed_smooth - speed_smooth.min()) / (speed_smooth.max() - speed_smooth.min() + 1e-9)
+    radii = max_radius - speed_norm * (max_radius - min_radius)
+    print(radii)
+    return radii.astype(int).tolist()
 
 
 def get_fingertip(landmarks, w, h):
@@ -70,9 +104,14 @@ def main():
             if result.hand_landmarks:
                 landmarks = result.hand_landmarks[0]
                 draw_hand(frame, landmarks, w, h)
-                draw_point(frame, landmarks, w, h)
+
 
                 fx, fy = get_fingertip(landmarks, w, h)
+                points.append((fx, fy))
+                draw_point(frame, landmarks, w, h)
+
+                current_speed = get_speed(points)
+
                 cv2.circle(frame, (fx, fy), 10, (0, 255, 255), -1)
                 cv2.putText(
                     frame,
