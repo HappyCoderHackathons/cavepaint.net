@@ -19,11 +19,71 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import numpy as np
+import torch
+import torch.nn as nn
 
 from triangulate import depth_inches_to_str, triangulate
 
 HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+GESTURE_MODEL_PATH = Path(__file__).with_name("gesture_model.pth")
+GESTURE_META_PATH = Path(__file__).with_name("gesture_meta.json")
 INDEX_FINGERTIP = 8
+GESTURE_CONFIDENCE = 0.5
+
+# ---------------------------------------------------------------------------
+# Gesture classifier (mirrors preview.py)
+# ---------------------------------------------------------------------------
+
+_FINGERTIP_INDICES = [4, 8, 12, 16, 20]
+_INPUT_DIM = 63 + 15  # 21 landmarks × 3 coords + 15 distance features
+
+
+class _GestureMLP(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(_INPUT_DIM, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64),  nn.BatchNorm1d(64),  nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 32),   nn.BatchNorm1d(32),  nn.ReLU(),
+            nn.Linear(32, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _compute_features(landmarks) -> np.ndarray:
+    coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks])
+    coords -= coords[0].copy()
+    ft = coords[_FINGERTIP_INDICES]
+    scale = max(np.linalg.norm(ft, axis=1).max(), 1e-6)
+    coords /= scale
+    ft = coords[_FINGERTIP_INDICES]
+    pair_dists = [np.linalg.norm(ft[i] - ft[j]) for i in range(5) for j in range(i + 1, 5)]
+    tip_dists = np.linalg.norm(ft, axis=1).tolist()
+    return np.concatenate([coords.flatten(), pair_dists, tip_dists]).astype(np.float32)
+
+
+class _GestureClassifier:
+    def __init__(self):
+        import json
+        meta = json.loads(GESTURE_META_PATH.read_text())
+        self.gestures = meta["gestures"]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        model = _GestureMLP(num_classes=len(self.gestures)).to(device)
+        model.load_state_dict(torch.load(GESTURE_MODEL_PATH, map_location=device, weights_only=True))
+        model.eval()
+        self.model = model
+
+    def classify(self, landmarks) -> tuple[str, float]:
+        """Return (gesture_name, confidence)."""
+        features = _compute_features(landmarks)
+        with torch.no_grad():
+            x = torch.from_numpy(features).unsqueeze(0).to(self.device)
+            probs = torch.softmax(self.model(x), dim=1)
+            conf, idx = probs.max(1)
+        return self.gestures[idx.item()], conf.item()
 
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
@@ -206,6 +266,14 @@ class StereoDrawingTracker:
             reader1 = _CameraReader(cap1)
             reader1.start()
 
+        # Load gesture classifier if model exists
+        gesture_clf = None
+        if GESTURE_MODEL_PATH.exists() and GESTURE_META_PATH.exists():
+            try:
+                gesture_clf = _GestureClassifier()
+            except Exception:
+                pass  # no model — draw always
+
         try:
             with _make_landmarker() as lm0, _make_landmarker() as lm1:
                 with ThreadPoolExecutor(max_workers=2) as pool:
@@ -231,10 +299,17 @@ class StereoDrawingTracker:
                             res0, res1 = f0.result(), f1.result()
 
                         tip0 = tip1 = None
+                        gesture = None
                         if res0.hand_landmarks:
                             tip0 = _draw_hand(frame0, res0.hand_landmarks[0], w, h)
+                            if gesture_clf:
+                                gesture, conf = gesture_clf.classify(res0.hand_landmarks[0])
+                                if conf < GESTURE_CONFIDENCE:
+                                    gesture = None
                         if res1.hand_landmarks:
                             tip1 = _draw_hand(frame1, res1.hand_landmarks[0], w, h)
+
+                        drawing = (gesture == "point") if gesture_clf else (tip0 is not None)
 
                         pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
@@ -244,6 +319,12 @@ class StereoDrawingTracker:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
                         cv2.putText(frame1, label1, (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+                        # Gesture label on left frame
+                        if gesture:
+                            g_color = (0, 255, 0) if gesture == "point" else (0, 165, 255)
+                            cv2.putText(frame0, gesture, (10, 65),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, g_color, 2, cv2.LINE_AA)
 
                         combined = cv2.hconcat([frame0, frame1])
 
@@ -257,7 +338,7 @@ class StereoDrawingTracker:
                             if self.canvas is None or self.canvas.shape != combined.shape:
                                 self.canvas = np.zeros(combined.shape, dtype=np.uint8)
 
-                            if tip0:
+                            if drawing and tip0:
                                 self._points.append(tip0)
                                 self._last_radius = _draw_segment(
                                     self.canvas, self._points, self._last_radius
