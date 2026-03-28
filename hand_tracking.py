@@ -22,8 +22,21 @@ def draw_point(frame, landmarks, w, h):
         return
     
     radii = infer_pressure_from_speed(points, min_radius=4, max_radius=12)
-    for center, radius in zip(points, radii):
-        cv2.circle(frame, center=center, radius=radius, color=(255, 0, 0), thickness=-1)
+    for i in range(1, len(points)):
+        p1, p2 = np.array(points[i-1]), np.array(points[i])
+        r1, r2 = radii[i-1], radii[i]
+
+        #cv2.circle(frame, tuple(p1), r1, (0, 0, 0), -1, cv2.LINE_AA)
+        #cv2.circle(frame, tuple(p2), r2, (0, 0, 0), -1, cv2.LINE_AA)
+
+        direction = p2 - p1
+        length = np.linalg.norm(direction)
+
+        perp = np.array([-direction[1], direction[0]]) / length
+
+        quad = np.array([p1 + perp * r1, p1-perp * r1, p2+perp * r2, p2-perp * r2], dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(frame, [quad], (255,0,0))
+
 
 def infer_pressure_from_speed(points, min_radius=2, max_radius=12):
     """
