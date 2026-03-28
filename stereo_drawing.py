@@ -139,9 +139,9 @@ def find_cameras(max_index=8) -> list[int]:
     for i in range(max_index + 1):
         # Make backend compatible for mac
         if platform.system() == 'Windows': 
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         else:
-            cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+            cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
 
         if cap.isOpened():
             found.append(i)
