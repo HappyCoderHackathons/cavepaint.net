@@ -2,7 +2,7 @@ import os
 from flask import Flask, Response, render_template
 import cv2
 
-from hand_tracking_class import HandTracker
+from hand_tracking import HandTracker
 
 app = Flask(__name__)
 
