@@ -14,11 +14,6 @@ HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 BaseOptions = mp.tasks.BaseOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-def get_speed(points):
-    if len(points) < 2:
-        return 0.0
-    return float(np.linalg.norm(np.array(points[-1]) - np.array(points[-2])))
-
 def draw_point(frame, landmarks, w, h): 
     lm = landmarks[INDEX_FINGERTIP]
 
@@ -109,8 +104,6 @@ def main():
                 fx, fy = get_fingertip(landmarks, w, h)
                 points.append((fx, fy))
                 draw_point(frame, landmarks, w, h)
-
-                current_speed = get_speed(points)
 
                 cv2.circle(frame, (fx, fy), 10, (0, 255, 255), -1)
                 cv2.putText(
