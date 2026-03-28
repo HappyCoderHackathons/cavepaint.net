@@ -11,7 +11,8 @@
 </head>
 <body>
   <video id="video" autoplay playsinline muted></video>
-  <button onclick="fetch('/clear', {method:'POST'})">Clear Canvas</button>
+  <button onclick="fetch('/undo',  {method:'POST'})">Undo</button>
+  <button onclick="fetch('/clear', {method:'POST'})">Clear</button>
   <script>
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]

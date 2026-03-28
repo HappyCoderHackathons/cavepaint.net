@@ -86,6 +86,11 @@ async def clear(request):
     return web.Response(status=204)
 
 
+async def undo(request):
+    tracker.undo()
+    return web.Response(status=204)
+
+
 async def cameras(request):
     found = find_cameras()
     return web.Response(content_type="application/json", text=json.dumps(found))
@@ -102,6 +107,7 @@ app.on_shutdown.append(on_shutdown)
 app.router.add_get("/", index)
 app.router.add_post("/offer", offer)
 app.router.add_post("/clear", clear)
+app.router.add_post("/undo", undo)
 app.router.add_get("/cameras", cameras)
 
 if __name__ == "__main__":

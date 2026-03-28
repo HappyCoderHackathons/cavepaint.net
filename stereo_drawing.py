@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from stroke import StrokeStore
 from triangulate import depth_inches_to_str, triangulate
 
 HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
@@ -168,31 +169,6 @@ def _draw_hand(frame, landmarks, w, h):
     return pts[INDEX_FINGERTIP]
 
 
-def _draw_segment(canvas, points, last_radius):
-    if len(points) < 2:
-        return last_radius
-
-    p1 = np.array(points[-2], dtype=np.float32)
-    p2 = np.array(points[-1], dtype=np.float32)
-    direction = p2 - p1
-    length = float(np.linalg.norm(direction))
-    if length < 1e-6:
-        return last_radius
-
-    speed_norm = min(length / 40.0, 1.0)
-    target_radius = int(12 - speed_norm * (12 - 4))
-    radius = int(last_radius * 0.6 + target_radius * 0.4)
-
-    perp = np.array([-direction[1], direction[0]], dtype=np.float32) / length
-    quad = np.array(
-        [p1 + perp * radius, p1 - perp * radius, p2 - perp * radius, p2 + perp * radius],
-        dtype=np.int32,
-    ).reshape((-1, 1, 2))
-
-    cv2.fillPoly(canvas, [quad], (255, 0, 0))
-    cv2.circle(canvas, tuple(p1.astype(int)), radius, (255, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(canvas, tuple(p2.astype(int)), radius, (255, 0, 0), -1, cv2.LINE_AA)
-    return radius
 
 
 class StereoDrawingTracker:
@@ -204,16 +180,18 @@ class StereoDrawingTracker:
 
         self.lock = threading.Lock()
         self.output_frame = None
-        self.canvas = None
+        self._strokes = StrokeStore()
+        self._was_drawing = False
         self.running = False
         self.thread = None
-        self._points = []
-        self._last_radius = 8
 
     def clear_canvas(self):
         with self.lock:
-            self.canvas = None
-            self._points = []
+            self._strokes.clear()
+
+    def undo(self):
+        with self.lock:
+            self._strokes.undo()
 
     def get_frame(self):
         with self.lock:
@@ -224,8 +202,6 @@ class StereoDrawingTracker:
     def start(self):
         if self.running:
             return
-        self._points = []
-        self._last_radius = 8
         self.running = True
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
@@ -332,10 +308,6 @@ class StereoDrawingTracker:
                             cv2.putText(frame0, gesture, (10, 65),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, g_color, 2, cv2.LINE_AA)
                             
-                        print(f"frame0: {frame0.shape}, frame1: {frame1.shape}")
-                        combined = cv2.hconcat([frame0, frame1])
-
-
                         combined = cv2.hconcat([frame0, frame1])
 
                         if not single_cam:
@@ -344,36 +316,33 @@ class StereoDrawingTracker:
                             cv2.putText(combined, depth_str, (20, combined.shape[0] - 20),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, depth_color, 2, cv2.LINE_AA)
 
+                        # Use triangulated Z when available, else 0
+                        z = pos3d[2] if pos3d else 0.0
+
                         with self.lock:
-                            if self.canvas is None or self.canvas.shape != combined.shape:
-                                self.canvas = np.zeros(combined.shape, dtype=np.uint8)
+                            if erasing and tip0:
+                                if self._was_drawing:
+                                    self._strokes.end()
+                                self._strokes.erase_near(tip0[0], tip0[1], radius=40)
+                                self._was_drawing = False
+                            elif drawing and tip0:
+                                if not self._was_drawing:
+                                    self._strokes.begin()
+                                self._strokes.add_point(tip0[0], tip0[1], z)
+                                self._was_drawing = True
+                            else:
+                                if self._was_drawing:
+                                    self._strokes.end()
+                                self._was_drawing = False
 
-                            if drawing and tip0:
-                                self._points.append(tip0)
-                                self._last_radius = _draw_segment(
-                                    self.canvas, self._points, self._last_radius
-                                )
-                            elif erasing and tip0:
-                                tx, ty = tip0
-                                ERASE_RADIUS = 30
-                                self._points = [
-                                    p for p in self._points
-                                    if np.hypot(p[0] - tx, p[1] - ty) > ERASE_RADIUS
-                                ]
+                            stroke_canvas = self._strokes.render(combined.shape)
+                            mask = stroke_canvas.any(axis=2)
+                            combined[mask] = stroke_canvas[mask]
 
-                                self.canvas = np.zeros(combined.shape, dtype=np.uint8)
-                                self._last_radius = 8
-                                for i in range(1, len(self._points)):
-                                    self._last_radius = _draw_segment(
-                                        self.canvas, self._points[:i+1], self._last_radius
-                                    )
+                            # Erase cursor
+                            if erasing and tip0:
+                                cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
 
-                            elif not gesture:
-                                print("TRYING TO ERASE")
-                                #self._points.clear()
-
-                            mask = self.canvas.any(axis=2)
-                            combined[mask] = self.canvas[mask]
                             self.output_frame = combined
 
         except Exception as exc:
