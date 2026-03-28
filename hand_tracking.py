@@ -4,11 +4,19 @@ from pathlib import Path
 
 HAND_MODEL_PATH = Path("hand_landmarker.task")
 INDEX_FINGERTIP = 8
+points = []
 
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 BaseOptions = mp.tasks.BaseOptions
 RunningMode = mp.tasks.vision.RunningMode
+
+def draw_point(frame, landmarks, w, h):
+    lm = landmarks[INDEX_FINGERTIP]
+    points.append((int(lm.x * w), int(lm.y * h)))
+    for center in points:
+        cv2.circle(frame, center = center, radius = 5,color = (255, 255, 0),thickness=5)
+
 
 
 def get_fingertip(landmarks, w, h):
@@ -62,6 +70,7 @@ def main():
             if result.hand_landmarks:
                 landmarks = result.hand_landmarks[0]
                 draw_hand(frame, landmarks, w, h)
+                draw_point(frame, landmarks, w, h)
 
                 fx, fy = get_fingertip(landmarks, w, h)
                 cv2.circle(frame, (fx, fy), 10, (0, 255, 255), -1)
@@ -75,6 +84,8 @@ def main():
                     2,
                     cv2.LINE_AA,
                 )
+            else:
+                points.clear()
 
             cv2.imshow("Hand Tracking", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
