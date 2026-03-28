@@ -287,6 +287,10 @@ class StereoDrawingTracker:
 
                         frame0 = cv2.flip(frame0, 1)
                         frame1 = cv2.flip(frame1, 1)
+
+                        if frame0.shape != frame1.shape:
+                            frame1 = cv2.resize(frame1, (frame0.shape[1], frame0.shape[0]))
+
                         h, w = frame0.shape[:2]
                         ts = int(time.time() * 1000)
 
@@ -311,6 +315,8 @@ class StereoDrawingTracker:
 
                         drawing = (gesture == "point") if gesture_clf else (tip0 is not None)
 
+                        erasing = (gesture == "fist") if gesture_clf else False
+
                         pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
                         label0 = f"CAM {self.cam0}" + (" (left)" if not single_cam else "")
@@ -325,6 +331,10 @@ class StereoDrawingTracker:
                             g_color = (0, 255, 0) if gesture == "point" else (0, 165, 255)
                             cv2.putText(frame0, gesture, (10, 65),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, g_color, 2, cv2.LINE_AA)
+                            
+                        print(f"frame0: {frame0.shape}, frame1: {frame1.shape}")
+                        combined = cv2.hconcat([frame0, frame1])
+
 
                         combined = cv2.hconcat([frame0, frame1])
 
@@ -343,8 +353,24 @@ class StereoDrawingTracker:
                                 self._last_radius = _draw_segment(
                                     self.canvas, self._points, self._last_radius
                                 )
-                            else:
-                                self._points.clear()
+                            elif erasing and tip0:
+                                tx, ty = tip0
+                                ERASE_RADIUS = 30
+                                self._points = [
+                                    p for p in self._points
+                                    if np.hypot(p[0] - tx, p[1] - ty) > ERASE_RADIUS
+                                ]
+
+                                self.canvas = np.zeros(combined.shape, dtype=np.uint8)
+                                self._last_radius = 8
+                                for i in range(1, len(self._points)):
+                                    self._last_radius = _draw_segment(
+                                        self.canvas, self._points[:i+1], self._last_radius
+                                    )
+
+                            elif not gesture:
+                                print("TRYING TO ERASE")
+                                #self._points.clear()
 
                             mask = self.canvas.any(axis=2)
                             combined[mask] = self.canvas[mask]
