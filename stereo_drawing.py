@@ -21,6 +21,7 @@ import mediapipe as mp
 import numpy as np
 import torch
 import torch.nn as nn
+import platform
 
 from stroke import StrokeStore
 from triangulate import depth_inches_to_str, triangulate
@@ -118,7 +119,12 @@ class _CameraReader(threading.Thread):
 
 
 def _open_camera(index, width, height):
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    # Make backend compatible for mac
+    if platform.system() == 'Windows': 
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -131,7 +137,12 @@ def find_cameras(max_index=8) -> list[int]:
     """Return indices of all cameras that open successfully."""
     found = []
     for i in range(max_index + 1):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        # Make backend compatible for mac
+        if platform.system() == 'Windows': 
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+
         if cap.isOpened():
             found.append(i)
         cap.release()
@@ -371,7 +382,7 @@ def main():
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     args = parser.parse_args()
-
+ 
     tracker = StereoDrawingTracker(
         cam0=args.cam0, cam1=args.cam1, width=args.width, height=args.height
     )
