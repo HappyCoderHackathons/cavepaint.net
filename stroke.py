@@ -28,9 +28,10 @@ class Stroke:
     min_radius: int = 2
 
     # Input smoothing
-    _smooth_alpha: float = 0.45   # EMA blend (0=no smoothing, 1=no follow)
-    _min_dist: float = 4.0        # skip points closer than this (pixels)
+    _smooth_alpha: float = 0.25   # EMA blend (0=no smoothing, 1=no follow)
+    _min_dist: float = 2.0        # skip points closer than this (pixels)
 
+    
     # --- mutation ----------------------------------------------------------
 
     def add(self, x: float, y: float, z: float = 0.0):
@@ -91,7 +92,7 @@ class Stroke:
         norm = min(speed / max(max_spd, 1e-6), 1.0)
         return max(self.min_radius, int(self.max_radius - norm * (self.max_radius - self.min_radius)))
 
-    def _catmull_rom(self, px: list, speeds: list, max_spd: float, steps: int = 20):
+    def _catmull_rom(self, px: list, speeds: list, max_spd: float, steps: int = 10):
         """Catmull-Rom interpolation through 2D pixel points.
 
         Returns (smooth_pts, radii) with len = (len(px)-1)*steps + 1.
@@ -173,6 +174,7 @@ class StrokeStore:
         self._active: Stroke | None = None
         self._cache: np.ndarray | None = None
         self._dirty = False
+        self._pixel_edited = False
 
     # --- stroke lifecycle --------------------------------------------------
 
@@ -197,22 +199,49 @@ class StrokeStore:
             self._completed.pop()
             self._dirty = True
 
+    # def erase_near(self, x: float, y: float, radius: float = 40.0):
+    #     """Remove any completed stroke that has a point within *radius* pixels of (x, y)."""
+    #     r2 = radius * radius
+    #     before = len(self._completed)
+    #     new_completed = []
+    #     for s in self._completed:
+    # # Split stroke at erased points rather than reconnecting across gaps
+    #         current_pts, current_times = [], []
+    #         for p, t in zip(s.pts, s.times):
+    #             if (p[0] - x) ** 2 + (p[1] - y) ** 2 > r2:
+    #                 current_pts.append(p)
+    #                 current_times.append(t)
+    #             else:
+    #                 if len(current_pts) >= 2:
+    #                     new_s = Stroke(color=s.color, max_radius=s.max_radius, min_radius=s.min_radius)
+    #                     new_s.pts = current_pts
+    #                     new_s.times = current_times
+    #                     new_completed.append(new_s)
+    #                 current_pts, current_times = [], []
+    #         if len(current_pts) >= 2:
+    #             new_s = Stroke(color=s.color, max_radius=s.max_radius, min_radius=s.min_radius)
+    #             new_s.pts = current_pts
+    #             new_s.times = current_times
+    #             new_completed.append(new_s)
+    #     self._completed = new_completed
+
+
+    #     if len(self._completed) != before:
+    #         self._dirty = True
+
     def erase_near(self, x: float, y: float, radius: float = 40.0):
-        """Remove any completed stroke that has a point within *radius* pixels of (x, y)."""
-        r2 = radius * radius
-        before = len(self._completed)
-        self._completed = [
-            s for s in self._completed
-            if not any((px - x) ** 2 + (py - y) ** 2 <= r2 for px, py, *_ in s.pts)
-        ]
-        if len(self._completed) != before:
-            self._dirty = True
+        if self._cache is None:
+            return
+        cv2.circle(self._cache, (int(x), int(y)), int(radius), (0, 0, 0), -1, cv2.LINE_AA)
+        self._pixel_edited = True # Has been erased over
+
 
     def clear(self):
         self._completed.clear()
         self._active = None
         self._cache = None
         self._dirty = False
+        self._pixel_edited = False
 
     # --- rendering ---------------------------------------------------------
 
@@ -221,7 +250,7 @@ class StrokeStore:
 
         project(x, y, z) -> (px, py) | None  for 3D -> 2D projection.
         """
-        if self._cache is None or self._cache.shape != shape or self._dirty:
+        if self._cache is None or self._cache.shape != shape or (self._dirty and not self._pixel_edited):
             self._cache = np.zeros(shape, dtype=np.uint8)
             for s in self._completed:
                 s.render(self._cache, project)
@@ -243,5 +272,8 @@ class StrokeStore:
     def _commit_active(self):
         if self._active and not self._active.empty():
             self._completed.append(self._active)
-            self._dirty = True
+            if self._pixel_edited and self._cache is not None:
+                self._active.render(self._cache)
+            else:
+                self._dirty = True
         self._active = None

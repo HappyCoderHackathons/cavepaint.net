@@ -323,7 +323,7 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 if self._was_drawing:
                                     self._strokes.end()
-                                self._strokes.erase_near(tip0[0], tip0[1], radius=40)
+                                self._strokes.erase_near(tip0[0], tip0[1], radius=30)
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
