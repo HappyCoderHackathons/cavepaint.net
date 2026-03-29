@@ -79,6 +79,13 @@ class MongoWhiteboardReplay:
         return _COLOR_NAME_TO_BGR["black"]
 
     @staticmethod
+    def _coerce_radius(value, default: int = 10) -> int:
+        try:
+            return max(1, int(round(float(value))))
+        except (TypeError, ValueError):
+            return max(1, int(default))
+
+    @staticmethod
     def _append_point(stroke: Stroke, x: float, y: float, z: float, event_time: float) -> None:
         before = len(stroke.pts)
         stroke.add(float(x), float(y), float(z))
@@ -112,7 +119,7 @@ class MongoWhiteboardReplay:
         point_docs = list(
             self._points_col.find(
                 point_query,
-                {"_id": 1, "drawingId": 1, "seq": 1, "t": 1, "position": 1, "color": 1},
+                {"_id": 1, "drawingId": 1, "seq": 1, "t": 1, "position": 1, "color": 1, "brushRadius": 1},
             ).sort([("_id", 1)])
         )
         erase_docs = list(
@@ -147,6 +154,7 @@ class MongoWhiteboardReplay:
                     "y": float(y),
                     "z": float(z),
                     "color": self._coerce_color(doc.get("color")),
+                    "brush_radius": self._coerce_radius(doc.get("brushRadius"), default=10),
                 }
             )
 
@@ -185,7 +193,10 @@ class MongoWhiteboardReplay:
                 drawing_key = event["drawing_key"]
                 stroke = self._active_by_drawing.get(drawing_key)
                 if stroke is None:
-                    stroke = Stroke(color=event["color"])
+                    stroke = Stroke(
+                        color=event["color"],
+                        max_radius=self._coerce_radius(event.get("brush_radius"), default=10),
+                    )
                     self._active_by_drawing[drawing_key] = stroke
                 self._append_point(stroke, event["x"], event["y"], event["z"], event["t"])
                 continue

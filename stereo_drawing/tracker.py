@@ -300,7 +300,7 @@ class StereoDrawingTracker:
     # MongoDB helpers
     # ------------------------------------------------------------------
 
-    def _start_drawing_doc(self, color="black"):
+    def _start_drawing_doc(self, color="black", brush_radius=None):
         if not self._mongo_enabled:
             return
         now = self._utcnow()
@@ -311,6 +311,8 @@ class StereoDrawingTracker:
             "rigRotationDeg": 0,
             "sessionId": self._session_id,
         }
+        if brush_radius is not None:
+            doc["brushRadius"] = int(max(1, round(float(brush_radius))))
         try:
             result = drawings_col.insert_one(doc)
             self._active_drawing_id = result.inserted_id
@@ -319,7 +321,7 @@ class StereoDrawingTracker:
             print(f"[mongo] drawing insert failed: {exc}")
             self._active_drawing_id = None
 
-    def _insert_point_doc(self, x, y, z, color="black"):
+    def _insert_point_doc(self, x, y, z, color="black", brush_radius=None):
         if not self._mongo_enabled or self._active_drawing_id is None:
             return
         point_doc = {
@@ -329,6 +331,8 @@ class StereoDrawingTracker:
             "color": self._serialize_color(color),
             "sessionId": self._session_id,
         }
+        if brush_radius is not None:
+            point_doc["brushRadius"] = int(max(1, round(float(brush_radius))))
         try:
             points_col.insert_one(point_doc)
             self._seq += 1
@@ -459,6 +463,10 @@ class StereoDrawingTracker:
         _fps_t0 = time.monotonic()
         _smooth_pinch = 0.5
         _resize_cooldown = 0
+        _small_radius_lock_until = 0.0
+        _small_radius_lock_px = 16
+        _small_radius_lock_sec = 0.8
+        _prev_action = "idle"
 
         while self.running:
             frame0 = reader0.get()
@@ -505,6 +513,19 @@ class StereoDrawingTracker:
                 erasing  = (gesture == "fist")
             else:
                 drawing = resizing = erasing = False
+
+            if resizing:
+                action = "resizing"
+            elif drawing:
+                action = "drawing"
+            elif erasing:
+                action = "erasing"
+            else:
+                action = "idle"
+
+            # Entering resize mode from drawing should feel immediate.
+            #if action == "resizing" and _prev_action == "drawing":
+                #_small_radius_lock_until = 0.0
 
             if resizing:
                 _resize_cooldown = 18
@@ -576,22 +597,34 @@ class StereoDrawingTracker:
                 elif drawing and tip0:
                     if not self._was_drawing:
                         active_color = PALETTE[self._color_idx]
-                        self._strokes.begin(color=active_color)
-                        self._start_drawing_doc(color=active_color)
+                        active_radius = int(max(1, round(float(self._strokes.current_radius))))
+                        self._strokes.begin(color=active_color, max_radius=active_radius)
+                        self._start_drawing_doc(color=active_color, brush_radius=active_radius)
                     active = self._strokes._active
                     before_len = len(active.pts) if active is not None else 0
                     self._strokes.add_point(tip0[0], tip0[1], z)
                     active = self._strokes._active
                     if active is not None and len(active.pts) > before_len:
                         sx, sy, sz = active.pts[-1]
-                        self._insert_point_doc(sx, sy, sz, color=active.color)
+                        point_radius = int(max(1, round(float(getattr(active, "max_radius", self._strokes.current_radius)))))
+                        self._insert_point_doc(sx, sy, sz, color=active.color, brush_radius=point_radius)
                     self._was_drawing = True
                 elif resizing and tip0 and tip8 and tip12:
                     PINCH_MAX = 0.25
                     raw_dist = math.hypot(tip12.x - tip8.x, tip12.y - tip8.y)
                     pinch_norm = 1.0 - min(raw_dist / PINCH_MAX, 1.0)
                     _smooth_pinch = 0.85 * _smooth_pinch + 0.15 * pinch_norm
-                    self._strokes.current_radius = self._strokes._radius(_smooth_pinch)
+                    now_mono = time.monotonic()
+                    next_radius = self._strokes._radius(_smooth_pinch)
+                    # Arm lock only on threshold crossing (prevents lock restart each frame).
+                    if (
+                        next_radius <= _small_radius_lock_px
+                        and self._strokes.current_radius > _small_radius_lock_px
+                    ):
+                        _small_radius_lock_until = now_mono + _small_radius_lock_sec
+                    if now_mono < _small_radius_lock_until:
+                        next_radius = min(next_radius, _small_radius_lock_px)
+                    self._strokes.current_radius = int(max(1, next_radius))
                 else:
                     if self._was_drawing:
                         self._strokes.end()
@@ -633,3 +666,4 @@ class StereoDrawingTracker:
                 _fps_t0 = _now
 
             swipe_events = [(lbl, ci, f - 1) for lbl, ci, f in swipe_events if f > 1]
+            _prev_action = action
