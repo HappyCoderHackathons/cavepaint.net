@@ -89,7 +89,9 @@ class StereoDrawingTracker:
         with self.lock:
             if self.output_frame is None:
                 return None
-            return self.output_frame.copy()
+            # Return latest immutable frame reference to avoid an extra full-frame copy
+            # per WebRTC packet; tracker replaces this ndarray each loop.
+            return self.output_frame
 
     def get_state(self):
         with self.lock:

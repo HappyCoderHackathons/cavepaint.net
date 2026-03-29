@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import time
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -22,18 +24,29 @@ class StereoVideoTrack(VideoStreamTrack):
     def __init__(self, tracker: StereoDrawingTracker):
         super().__init__()
         self.tracker = tracker
+        self._clock_rate = 90000
+        requested_fps = int(os.getenv("STREAM_FPS", "30"))
+        self._target_fps = max(5, min(90, requested_fps))
+        self._ticks_per_frame = int(self._clock_rate / self._target_fps)
+        self._pts = 0
+        self._next_wall = time.monotonic()
 
     async def recv(self):
-        pts, time_base = await self.next_timestamp()
+        now = time.monotonic()
+        delay = self._next_wall - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._next_wall = max(self._next_wall, time.monotonic()) + (1.0 / self._target_fps)
 
         frame = self.tracker.get_frame()
         if frame is None:
             frame = np.zeros((480, 1280, 3), dtype=np.uint8)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
+        # Tracker frames are BGR already; avoid per-frame color conversion cost.
+        video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        self._pts += self._ticks_per_frame
+        video_frame.pts = self._pts
+        video_frame.time_base = Fraction(1, self._clock_rate)
         return video_frame
 
 
@@ -170,8 +183,15 @@ async def whiteboard(request):
     except ValueError:
         raise web.HTTPBadRequest(reason="Invalid whiteboard query params")
 
-    frame = tracker.render_whiteboard(yaw_deg=yaw, fov_deg=fov, width=width, height=height)
-    ok, encoded = cv2.imencode(".png", frame)
+    # Keep aiohttp loop responsive: do CPU-heavy render/encode off the event loop.
+    frame = await asyncio.to_thread(
+        tracker.render_whiteboard,
+        yaw_deg=yaw,
+        fov_deg=fov,
+        width=width,
+        height=height,
+    )
+    ok, encoded = await asyncio.to_thread(cv2.imencode, ".png", frame)
     if not ok:
         raise web.HTTPInternalServerError(reason="Failed to encode whiteboard image")
     return web.Response(
