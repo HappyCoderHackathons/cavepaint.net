@@ -654,6 +654,38 @@ class StereoDrawingTracker:
             self._undo_last_drawing_doc()
             return "draw", None
 
+    def _submit_and_start_new_session(self):
+        prev_session = self._session_id
+
+        if self._was_drawing:
+            self._strokes.end()
+            self._finish_drawing_doc(status="completed")
+            self._was_drawing = False
+        if self._was_erasing:
+            self._finish_erase_action(status="completed")
+            self._was_erasing = False
+
+        self._strokes.clear()
+        self._erase_batches.clear()
+        self._active_drawing_id = None
+        self._active_draw_action_id = None
+        self._active_erase_action_id = None
+        self._active_erase_batch_id = None
+        self._seq = 0
+
+        self._session_id = uuid4().hex
+        if points_col is not None and erases_col is not None:
+            self._mongo_whiteboard = MongoWhiteboardReplay(
+                points_col=points_col,
+                erases_col=erases_col,
+                session_id=self._session_id,
+                refresh_interval_ms=WHITEBOARD_DB_REFRESH_MS,
+            )
+        else:
+            self._mongo_whiteboard = None
+
+        print(f"[session] Drawing session: {self._session_id} (submitted {prev_session})")
+
     # ------------------------------------------------------------------
     # Main processing loop
     # ------------------------------------------------------------------
@@ -837,6 +869,8 @@ class StereoDrawingTracker:
                 _resize_cooldown -= 1
                 drawing = False
 
+            submit_swipe_up = False
+
             # Swipe detection
             if res0.hand_landmarks and swipe_det:
                 lms = res0.hand_landmarks[0]
@@ -852,7 +886,9 @@ class StereoDrawingTracker:
                         self._color_idx = (self._color_idx + 1) % len(PALETTE)
                     elif label == "swipe_left":
                         self._color_idx = (self._color_idx - 1) % len(PALETTE)
-                    if label in ("swipe_left", "swipe_right"):
+                    elif label == "swipe_up":
+                        submit_swipe_up = True
+                    if label in ("swipe_left", "swipe_right", "swipe_up"):
                         swipe_events.append((label, self._color_idx, SWIPE_DISPLAY_FRAMES))
 
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
@@ -912,6 +948,10 @@ class StereoDrawingTracker:
             z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
+                if submit_swipe_up:
+                    self._submit_and_start_new_session()
+                    self._canvas_version += 1
+
                 if erasing and tip0 and not self._was_erasing:
                     self._start_erase_action()
                 elif (not erasing or not tip0) and self._was_erasing:

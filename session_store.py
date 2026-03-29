@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from stroke import Stroke
 
@@ -228,7 +228,8 @@ class SessionStore:
     @staticmethod
     def _ts(value, oid=None) -> float:
         if isinstance(value, datetime):
-            return value.timestamp()
+            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, str):
@@ -267,5 +268,6 @@ class SessionStore:
         if value is None:
             return None
         if isinstance(value, datetime):
-            return value.isoformat()
+            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         return str(value)
