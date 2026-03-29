@@ -209,7 +209,7 @@
     };
 
     let yaw = 0.0;
-    const fov = 80.0;
+    const fov = 120.0;  // wide FOV to show panoramic 180° canvas
     let dragging = false;
     let dragStartX = 0;
     let dragStartYaw = 0;
@@ -323,17 +323,17 @@
     rotateRightBtn.addEventListener("click", () => rotate(1));
 
     // -----------------------------------------------------------------------
-    // Auto-center: rotate mount to keep hand in frame center
+    // Auto-center: proportional controller — small angles, timer-driven
     // -----------------------------------------------------------------------
-    const FRAME_WIDTH   = 640;
-    const CENTER_X      = FRAME_WIDTH / 2;
-    const DEAD_ZONE_PX  = 60;   // ignore offsets smaller than this
-    const MAX_STEP_DEG  = 25;   // max degrees per correction step
-    const MIN_STEP_DEG  = 3;    // minimum meaningful step
-    const POLL_MS       = 300;  // how often to check motor status after a move
+    const FRAME_WIDTH    = 640;
+    const CENTER_X       = FRAME_WIDTH / 2;
+    const DEAD_ZONE_PX   = 40;   // px from center that counts as "at rest"
+    const MAX_DEG_TICK   = 2.0;  // max degrees sent per tick (full-offset hand)
+    const TICK_MS        = 150;  // controller interval
 
     let autoCenterEnabled = false;
     let motorBusy = false;
+    let motorBusyTimer = null;
     let lastHandX = null;
 
     const autoCenterBtn = document.createElement("button");
@@ -348,44 +348,37 @@
       autoCenterBtn.style.opacity = autoCenterEnabled ? "1" : "0.5";
     });
 
-    async function waitForMotor() {
-      while (true) {
-        try {
-          const r = await fetch("/api/motor_status");
-          const s = await r.json();
-          if (!s.rotating) break;
-        } catch (_) { break; }
-        await new Promise(res => setTimeout(res, POLL_MS));
-      }
-      motorBusy = false;
-    }
+    setInterval(() => {
+      if (!autoCenterEnabled || motorBusy || lastHandX == null) return;
+      const offset = lastHandX - CENTER_X;
+      const absOffset = Math.abs(offset);
+      if (absOffset <= DEAD_ZONE_PX) return;
 
-    function tryAutoCenter(handX) {
-      if (!autoCenterEnabled || motorBusy || handX == null) return;
-      const offset = handX - CENTER_X;
-      if (Math.abs(offset) <= DEAD_ZONE_PX) return;
-
-      // Opposite direction: hand right of center → rotate right (positive)
-      const raw = (offset / (CENTER_X - DEAD_ZONE_PX)) * MAX_STEP_DEG;
-      const deg = Math.sign(raw) * Math.max(MIN_STEP_DEG, Math.min(MAX_STEP_DEG, Math.abs(raw)));
+      // Linear ramp from 0 at dead-zone edge to MAX_DEG_TICK at frame edge
+      const t = Math.min((absOffset - DEAD_ZONE_PX) / (CENTER_X - DEAD_ZONE_PX), 1.0);
+      const deg = Math.sign(offset) * t * MAX_DEG_TICK;
 
       motorBusy = true;
+      // Estimate how long this small rotation takes, release lock after that
+      if (motorBusyTimer) clearTimeout(motorBusyTimer);
+      motorBusyTimer = setTimeout(() => { motorBusy = false; }, Math.abs(deg) / 360 * 3000 + 80);
+
       fetch("/api/rotate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ degrees: deg }),
       }).then(r => r.json()).then(res => {
-        if (res.error === "already rotating") motorBusy = false;
-        else waitForMotor();
-      }).catch(() => { motorBusy = false; });
-    }
+        if (res.error) { clearTimeout(motorBusyTimer); motorBusy = false; }
+      }).catch(() => { clearTimeout(motorBusyTimer); motorBusy = false; });
+    }, TICK_MS);
 
-    // Hook into applyState to pick up hand position
+    // Hook into applyState to pick up hand position + theta
     const _origApplyState = applyState;
     applyState = function(data) {
       _origApplyState(data);
+      if (data.theta != null) { window._theta = data.theta; syncLabels(); }
       const tip = (data.tracking || {}).tip0;
-      if (tip) { lastHandX = tip[0]; tryAutoCenter(lastHandX); }
+      if (tip) lastHandX = tip[0];
     };
 
     // -----------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +83,7 @@ class StereoDrawingTracker:
         self._stone_texture = self._load_stone_texture()
         self._board_base_cache_unshifted = None
         self._board_base_cache_size = None
+        self._theta = 0.0   # camera mount angle in degrees
         self._live_yaw_deg = 0.0
         self._live_fov_deg = 80.0
         print(f"[session] Drawing session: {self._session_id}")
@@ -101,6 +103,10 @@ class StereoDrawingTracker:
         self.running = False
         if self.thread is not None:
             self.thread.join(timeout=2)
+
+    def set_theta(self, degrees: float):
+        with self.lock:
+            self._theta = float(degrees)
 
     def get_frame(self):
         with self.lock:
@@ -226,14 +232,14 @@ class StereoDrawingTracker:
         yaw_rad = float(np.deg2rad(yaw_deg))
         fov_rad = float(np.deg2rad(fov_deg))
 
-        def project(px, py, pz):
-            return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
-
         stroke_layer = np.zeros((height, width, 3), dtype=np.uint8)
         for op in ops:
             if op.get("kind") == "stroke":
                 stroke = op.get("stroke")
                 if stroke is not None:
+                    theta_deg = getattr(stroke, "theta", 0.0)
+                    def project(px, py, pz, _t=theta_deg):
+                        return self._project_whiteboard_point(px, py, pz, _t, yaw_rad, fov_rad, width, height)
                     stroke.render(stroke_layer, project=project)
                 continue
 
@@ -242,11 +248,12 @@ class StereoDrawingTracker:
                 cy = float(op.get("y", 0.0))
                 cz = float(op.get("z", 0.0))
                 cr = float(op.get("radius", 30.0))
+                erase_theta = float(op.get("theta", 0.0))
                 for ez in (cz - 4.0, cz, cz + 4.0):
-                    center = self._project_whiteboard_point(cx, cy, ez, yaw_rad, fov_rad, width, height)
+                    center = self._project_whiteboard_point(cx, cy, ez, erase_theta, yaw_rad, fov_rad, width, height)
                     if center is None:
                         continue
-                    draw_r = self._project_erase_radius(cx, cy, ez, cr, yaw_rad, fov_rad, width, height)
+                    draw_r = self._project_erase_radius(cx, cy, ez, cr, erase_theta, yaw_rad, fov_rad, width, height)
                     cv2.circle(
                         stroke_layer,
                         (int(round(center[0])), int(round(center[1]))),
@@ -400,9 +407,14 @@ class StereoDrawingTracker:
         dst.times = list(src.times)
         return dst
 
+    # Brio 101 horizontal FOV at 640px width
+    _CAMERA_HFOV_DEG = 65.0
+    _PX_PER_DEG = 640.0 / _CAMERA_HFOV_DEG  # ≈ 9.85 px per degree of camera rotation
+
     @staticmethod
-    def _project_whiteboard_point(x, y, z, yaw_rad, fov_rad, width, height):
-        xw = float(x) - 320.0
+    def _project_whiteboard_point(x, y, z, theta_deg, yaw_rad, fov_rad, width, height):
+        # Offset x by camera mount angle so strokes at different theta land at the right world position
+        xw = (float(x) - 320.0) + theta_deg * StereoDrawingTracker._PX_PER_DEG
         yw = float(y) - 240.0
         zw = float(z) * 25.0 + 400.0
         c = float(np.cos(yaw_rad))
@@ -423,9 +435,9 @@ class StereoDrawingTracker:
         return float(u), float(v)
 
     @staticmethod
-    def _project_erase_radius(x, y, z, radius, yaw_rad, fov_rad, width, height):
-        c0 = StereoDrawingTracker._project_whiteboard_point(x, y, z, yaw_rad, fov_rad, width, height)
-        c1 = StereoDrawingTracker._project_whiteboard_point(x + float(radius), y, z, yaw_rad, fov_rad, width, height)
+    def _project_erase_radius(x, y, z, radius, theta_deg, yaw_rad, fov_rad, width, height):
+        c0 = StereoDrawingTracker._project_whiteboard_point(x, y, z, theta_deg, yaw_rad, fov_rad, width, height)
+        c1 = StereoDrawingTracker._project_whiteboard_point(x + float(radius), y, z, theta_deg, yaw_rad, fov_rad, width, height)
         if c0 is not None and c1 is not None:
             r = int(np.hypot(c1[0] - c0[0], c1[1] - c0[1]))
             return max(1, r)
@@ -845,9 +857,8 @@ class StereoDrawingTracker:
                     lm1 = stack.enter_context(make_landmarker())
                     has_pose = POSE_MODEL_PATH.exists()
                     pose_lm0 = stack.enter_context(make_pose_landmarker()) if has_pose else None
-                    pose_lm1 = (stack.enter_context(make_pose_landmarker())
-                                if has_pose and not single_cam else None)
-                    with ThreadPoolExecutor(max_workers=4) as pool:
+                    pose_lm1 = None  # cam1 pose unused; dropping it saves one full inference per frame
+                    with ThreadPoolExecutor(max_workers=3) as pool:
                         self._run_loop(
                             lm0, lm1, pool,
                             reader0, reader1, single_cam,
@@ -937,6 +948,10 @@ class StereoDrawingTracker:
         _opposite_swipe_lock_sec = 0.70
         _swipe_block_until = {"swipe_left": 0.0, "swipe_right": 0.0}
         _prev_action = "idle"
+        _pose_throttle = max(1, int(os.getenv("POSE_THROTTLE", "3")))
+        _pose_frame_idx = 0
+        _infer_w = int(os.getenv("INFER_W", "320"))
+        _infer_h = int(os.getenv("INFER_H", "240"))
 
         while self.running:
             frame0 = reader0.get()
@@ -955,19 +970,28 @@ class StereoDrawingTracker:
             h, w = frame0.shape[:2]
             ts = int(time.time() * 1000)
 
+            # Downscale frames for faster MediaPipe inference
+            if (w, h) != (_infer_w, _infer_h):
+                f0s = cv2.resize(frame0, (_infer_w, _infer_h))
+                f1s = cv2.resize(frame1, (_infer_w, _infer_h)) if not single_cam else f0s
+            else:
+                f0s, f1s = frame0, frame1
+
+            run_pose = (_pose_frame_idx % _pose_throttle == 0)
+            _pose_frame_idx += 1
+
             if single_cam:
-                res0 = detect(lm0, frame0, ts)
+                res0 = detect(lm0, f0s, ts)
                 res1 = res0
-                pose_res0 = detect_pose(pose_lm0, frame0, ts) if pose_lm0 else None
+                pose_res0 = detect_pose(pose_lm0, f0s, ts) if (pose_lm0 and run_pose) else None
                 pose_res1 = None
             else:
-                fh0 = pool.submit(detect, lm0, frame0, ts)
-                fh1 = pool.submit(detect, lm1, frame1, ts)
-                fp0 = pool.submit(detect_pose, pose_lm0, frame0, ts) if pose_lm0 else None
-                fp1 = pool.submit(detect_pose, pose_lm1, frame1, ts) if pose_lm1 else None
+                fh0 = pool.submit(detect, lm0, f0s, ts)
+                fh1 = pool.submit(detect, lm1, f1s, ts)
+                fp0 = pool.submit(detect_pose, pose_lm0, f0s, ts) if (pose_lm0 and run_pose) else None
                 res0, res1 = fh0.result(), fh1.result()
                 pose_res0 = fp0.result() if fp0 else None
-                pose_res1 = fp1.result() if fp1 else None
+                pose_res1 = None
 
             tip0 = tip1 = tip8 = tip12 = None
             gesture = None
@@ -1048,7 +1072,10 @@ class StereoDrawingTracker:
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
             fresh_mask = get_segmentation_mask(pose_res0) if pose_res0 else None
-            if fresh_mask is not None and fresh_mask.shape[:2] == frame0.shape[:2]:
+            if fresh_mask is not None:
+                if fresh_mask.shape[:2] != (h, w):
+                    fresh_mask = cv2.resize(fresh_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+                    fresh_mask = np.clip(fresh_mask, 0.0, 1.0)
                 _last_person_mask = fresh_mask
             person_mask = _last_person_mask
 
@@ -1147,6 +1174,7 @@ class StereoDrawingTracker:
                             color=active_color,
                             max_radius=active_radius,
                             min_radius=active_min_radius,
+                            theta=self._theta,
                         )
                         self._start_drawing_doc(color=active_color, brush_radius=active_radius)
                     active = self._strokes._active
