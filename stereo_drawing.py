@@ -585,9 +585,9 @@ class StereoDrawingTracker:
                                 if self._was_drawing:
                                     self._strokes.end()
                                     self._finish_drawing_doc(status="completed")
-                                erase_radius = 30
+                                erase_radius = self._strokes.current_radius
                                 self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
-                                self._insert_erase_doc(tip0[0], tip0[1], erase_radius)
+                                self._insert_erase_doc(tip0[0], tip0[1], radius = erase_radius)
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
@@ -615,7 +615,7 @@ class StereoDrawingTracker:
 
                             # Erase cursor
                             if erasing and tip0:
-                                cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
+                                cv2.circle(combined, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)
 
                             self._draw_swipe_events(combined, swipe_events, PALETTE)
                             self._draw_palette(combined, PALETTE, self._color_idx)
