@@ -190,6 +190,33 @@
         ></canvas>
         <div class="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-black/10 to-transparent"></div>
       </div>
+
+      <div class="mt-4 rounded-xl border border-stone-600/60 bg-cave1/60 p-3 shadow-[0_10px_30px_rgba(0,0,0,0.35)]">
+        <div class="flex flex-wrap items-center gap-2">
+          <input
+            id="narrativeImageUrl"
+            type="url"
+            placeholder="https://example.com/reference-image.jpg"
+            class="min-w-[220px] flex-1 rounded-lg border border-stone-400/25 bg-cave0/70 px-3 py-2 text-sm text-chalk placeholder:text-orange-100/35 focus:outline-none"
+          >
+          <button
+            id="startNarrationBtn"
+            class="rounded-full border border-amber-100/25 bg-gradient-to-b from-[#8b6a4f] via-[#6a4d38] to-[#3d2b20] px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-amber-50 shadow-[0_6px_14px_rgba(0,0,0,0.35)] transition hover:brightness-110"
+          >Start Narrative</button>
+          <button
+            id="stopNarrationBtn"
+            class="rounded-full border border-stone-200/20 bg-gradient-to-b from-[#6a6a6a] via-[#515151] to-[#383838] px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-stone-100 shadow-[0_6px_14px_rgba(0,0,0,0.3)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45"
+            disabled
+          >Stop</button>
+        </div>
+        <p id="narrativeStatus" class="mt-2 text-xs text-orange-100/70">
+          Narrator idle. Enter an image URL to begin.
+        </p>
+        <pre
+          id="narrativeOutput"
+          class="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-stone-500/35 bg-cave0/65 p-3 text-sm leading-relaxed text-orange-50/95"
+        ></pre>
+      </div>
     </section>
   </main>
 
@@ -202,6 +229,11 @@
 
     const undoBtn = document.getElementById("undoBtn");
     const clearBtn = document.getElementById("clearBtn");
+    const narrativeImageUrl = document.getElementById("narrativeImageUrl");
+    const startNarrationBtn = document.getElementById("startNarrationBtn");
+    const stopNarrationBtn = document.getElementById("stopNarrationBtn");
+    const narrativeStatus = document.getElementById("narrativeStatus");
+    const narrativeOutput = document.getElementById("narrativeOutput");
 
     const normalize360 = (value) => {
       const wrapped = value % 360;
@@ -219,6 +251,8 @@
     let liveYawSyncTimer = null;
     let liveYawPending = null;
     let lastLiveYawSent = null;
+    let narrationController = null;
+    let narrationSseBuffer = "";
 
     function angularDistanceDeg(a, b) {
       return Math.abs(((a - b + 540) % 360) - 180);
@@ -295,6 +329,122 @@
 
     undoBtn.addEventListener("click", () => postAction("/undo"));
     clearBtn.addEventListener("click", () => postAction("/clear"));
+
+    function setNarrativeStatus(msg, isError = false) {
+      narrativeStatus.textContent = msg;
+      narrativeStatus.className = isError
+        ? "mt-2 text-xs text-red-300"
+        : "mt-2 text-xs text-orange-100/70";
+    }
+
+    function appendNarrative(text) {
+      if (!text) return;
+      narrativeOutput.textContent += text;
+      narrativeOutput.scrollTop = narrativeOutput.scrollHeight;
+    }
+
+    function consumeNarrationSse(block) {
+      if (!block.trim()) return;
+      let eventType = "message";
+      let dataPayload = "";
+      for (const raw of block.split(/\r?\n/)) {
+        if (raw.startsWith("event:")) eventType = raw.slice(6).trim();
+        if (raw.startsWith("data:")) dataPayload += raw.slice(5).trim();
+      }
+      if (!dataPayload) return;
+
+      let payload = {};
+      try {
+        payload = JSON.parse(dataPayload);
+      } catch (_) {
+        payload = { text: dataPayload };
+      }
+
+      if (eventType === "delta") {
+        appendNarrative(payload.text || "");
+      } else if (eventType === "error") {
+        const details = payload.detail ? ` (${payload.detail})` : "";
+        setNarrativeStatus(`${payload.error || "Narration failed"}${details}`, true);
+      } else if (eventType === "done") {
+        setNarrativeStatus(`Narration complete (${payload.model || "model"}).`);
+      }
+    }
+
+    function stopNarration() {
+      if (!narrationController) return;
+      narrationController.abort();
+      narrationController = null;
+      setNarrativeStatus("Narration stopped.");
+      startNarrationBtn.disabled = false;
+      stopNarrationBtn.disabled = true;
+    }
+
+    async function startNarration() {
+      const imageUrl = (narrativeImageUrl.value || "").trim();
+      if (!imageUrl) {
+        setNarrativeStatus("Enter an image URL first.", true);
+        return;
+      }
+
+      if (narrationController) stopNarration();
+
+      const controller = new AbortController();
+      narrationController = controller;
+      narrationSseBuffer = "";
+      narrativeOutput.textContent = "";
+      setNarrativeStatus("Connecting to Snowflake Cortex…");
+      startNarrationBtn.disabled = true;
+      stopNarrationBtn.disabled = false;
+
+      try {
+        const resp = await fetch("/api/narrate_stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image_url: imageUrl }),
+          signal: controller.signal,
+        });
+
+        if (!resp.ok || !resp.body) {
+          const msg = await resp.text();
+          throw new Error(msg || `HTTP ${resp.status}`);
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        setNarrativeStatus("Narration streaming…");
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          narrationSseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+          let boundary = narrationSseBuffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const block = narrationSseBuffer.slice(0, boundary);
+            narrationSseBuffer = narrationSseBuffer.slice(boundary + 2);
+            consumeNarrationSse(block);
+            boundary = narrationSseBuffer.indexOf("\n\n");
+          }
+        }
+
+        if (narrationSseBuffer.trim()) {
+          consumeNarrationSse(narrationSseBuffer);
+          narrationSseBuffer = "";
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          // stopNarration() already set the status.
+        } else {
+          setNarrativeStatus(`Narration error: ${err.message || err}`, true);
+        }
+      } finally {
+        if (narrationController === controller) narrationController = null;
+        startNarrationBtn.disabled = false;
+        stopNarrationBtn.disabled = true;
+      }
+    }
+
+    startNarrationBtn.addEventListener("click", startNarration);
+    stopNarrationBtn.addEventListener("click", stopNarration);
 
     const rotateLeftBtn = document.getElementById("rotateLeftBtn");
     const rotateRightBtn = document.getElementById("rotateRightBtn");
