@@ -1,16 +1,19 @@
+import base64
 import asyncio
 import json
+import mimetypes
 import os
 import time
 from fractions import Fraction
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 import av
 import cv2
 import numpy as np
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 
 from stereo_drawing import PALETTE, StereoDrawingTracker, find_cameras
@@ -82,6 +85,89 @@ session_store = (
     if drawings_col is not None
     else None
 )
+
+_DEFAULT_NARRATION_PROMPT = (
+    "You are a cave storyteller narrating this image for a live drawing session. "
+    "Speak in vivid present tense, 1-3 short sentences at a time, and keep the tone cinematic."
+)
+
+
+def _snowflake_base_url() -> str | None:
+    base = os.getenv("SNOWFLAKE_BASE_URL") or os.getenv("SNOWFLAKE_ACCOUNT_URL")
+    if not base:
+        return None
+    return base.rstrip("/")
+
+
+def _to_data_uri_from_image_url(image_url: str, max_bytes: int = 8_000_000) -> str:
+    url = (image_url or "").strip()
+    if not url:
+        raise ValueError("image_url is required")
+    if url.startswith("data:"):
+        return url
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("image_url must start with http:// or https://")
+
+    req = Request(url, headers={"User-Agent": "cavepaint-net/1.0"})
+    with urlopen(req, timeout=15) as resp:
+        raw = resp.read(max_bytes + 1)
+        mime = ""
+        if hasattr(resp.headers, "get_content_type"):
+            mime = resp.headers.get_content_type() or ""
+        if not mime:
+            mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+
+    if len(raw) > max_bytes:
+        raise ValueError("image_url payload is too large (max 8MB)")
+
+    if not mime or mime == "application/octet-stream":
+        guessed, _ = mimetypes.guess_type(url)
+        mime = guessed or "image/jpeg"
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _extract_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for item in content:
+            if isinstance(item, str):
+                out.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("text"), str):
+                out.append(item["text"])
+        return "".join(out)
+    return ""
+
+
+def _extract_openai_delta_text(payload: dict) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    return _extract_text_from_content(delta.get("content"))
+
+
+def _extract_openai_message_text(payload: dict) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    return _extract_text_from_content(msg.get("content"))
+
+
+async def _sse_write(resp: web.StreamResponse, event: str, data: dict):
+    try:
+        await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+    except ConnectionResetError:
+        pass
 
 
 async def index(request):
@@ -209,6 +295,165 @@ async def set_live_view(request):
 
     tracker.set_live_view(yaw_deg=yaw, fov_deg=fov)
     return web.Response(status=204)
+
+
+async def narrate_stream(request):
+    response = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await response.prepare(request)
+
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        await _sse_write(response, "error", {"error": "Expected JSON body"})
+        await response.write_eof()
+        return response
+
+    image_url = str(data.get("image_url") or "").strip()
+    prompt = str(data.get("prompt") or _DEFAULT_NARRATION_PROMPT).strip()
+    try:
+        temperature = float(data.get("temperature", 0.8))
+    except (TypeError, ValueError):
+        temperature = 0.8
+    temperature = max(0.0, min(2.0, temperature))
+    if not image_url:
+        await _sse_write(response, "error", {"error": "image_url is required"})
+        await response.write_eof()
+        return response
+
+    base_url = _snowflake_base_url()
+    pat = os.getenv("SNOWFLAKE_PAT") or os.getenv("SNOWFLAKE_TOKEN")
+    if not base_url or not pat:
+        await _sse_write(
+            response,
+            "error",
+            {"error": "Set SNOWFLAKE_BASE_URL (or SNOWFLAKE_ACCOUNT_URL) and SNOWFLAKE_PAT first."},
+        )
+        await response.write_eof()
+        return response
+
+    requested_model = str(data.get("model") or os.getenv("SNOWFLAKE_CORTEX_MODEL") or "claude-4-sonnet").strip()
+    fallback_model = str(os.getenv("SNOWFLAKE_CORTEX_FALLBACK_MODEL") or "claude-sonnet-4-5").strip()
+    models_to_try = [requested_model]
+    if fallback_model and fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
+
+    try:
+        image_data_uri = await asyncio.to_thread(_to_data_uri_from_image_url, image_url)
+    except Exception as exc:
+        await _sse_write(response, "error", {"error": f"image_url fetch failed: {exc}"})
+        await response.write_eof()
+        return response
+
+    endpoint = f"{base_url}/api/v2/cortex/v1/chat/completions"
+    timeout = ClientTimeout(total=180)
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    async with ClientSession(timeout=timeout) as session:
+        attempted = []
+        streamed = False
+
+        for model_name in models_to_try:
+            attempted.append(model_name)
+            req_body = {
+                "model": model_name,
+                "stream": True,
+                "temperature": temperature,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a live cave-painting narrator. "
+                            "Describe what is happening in short, vivid beats while the user draws."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_data_uri}},
+                        ],
+                    },
+                ],
+            }
+
+            try:
+                async with session.post(endpoint, headers=headers, json=req_body) as upstream:
+                    if upstream.status >= 400:
+                        detail = await upstream.text()
+                        lower = detail.lower()
+                        if "unknown model" in lower and model_name != models_to_try[-1]:
+                            continue
+                        await _sse_write(
+                            response,
+                            "error",
+                            {
+                                "error": f"Snowflake request failed ({upstream.status})",
+                                "detail": detail[:800],
+                                "model": model_name,
+                            },
+                        )
+                        await response.write_eof()
+                        return response
+
+                    content_type = (upstream.headers.get("Content-Type") or "").lower()
+                    if "text/event-stream" in content_type:
+                        streamed = True
+                        pending = ""
+                        async for chunk in upstream.content.iter_chunked(4096):
+                            pending += chunk.decode("utf-8", errors="ignore")
+                            while "\n" in pending:
+                                line, pending = pending.split("\n", 1)
+                                line = line.rstrip("\r")
+                                if not line.startswith("data:"):
+                                    continue
+                                payload_txt = line[5:].strip()
+                                if not payload_txt:
+                                    continue
+                                if payload_txt == "[DONE]":
+                                    await _sse_write(response, "done", {"model": model_name})
+                                    await response.write_eof()
+                                    return response
+                                try:
+                                    payload = json.loads(payload_txt)
+                                except json.JSONDecodeError:
+                                    continue
+                                delta_text = _extract_openai_delta_text(payload)
+                                if delta_text:
+                                    await _sse_write(response, "delta", {"text": delta_text, "model": model_name})
+                        await _sse_write(response, "done", {"model": model_name})
+                        await response.write_eof()
+                        return response
+
+                    payload = await upstream.json(content_type=None)
+                    full_text = _extract_openai_message_text(payload)
+                    if full_text:
+                        await _sse_write(response, "delta", {"text": full_text, "model": model_name})
+                    await _sse_write(response, "done", {"model": model_name})
+                    await response.write_eof()
+                    return response
+            except Exception as exc:
+                if model_name != models_to_try[-1]:
+                    continue
+                await _sse_write(response, "error", {"error": f"Narration upstream error: {exc}"})
+                await response.write_eof()
+                return response
+
+        if not streamed:
+            await _sse_write(
+                response,
+                "error",
+                {"error": "No compatible model succeeded", "attempted_models": attempted},
+            )
+    await response.write_eof()
+    return response
 
 
 async def mouse_stroke(request):
@@ -386,6 +631,7 @@ app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_post("/live_view", set_live_view)
+app.router.add_post("/api/narrate_stream", narrate_stream)
 app.router.add_post("/stroke", mouse_stroke)
 app.router.add_get("/whiteboard.png", whiteboard)
 app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
