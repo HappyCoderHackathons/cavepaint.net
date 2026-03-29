@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import platform
+import math
 
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -520,10 +521,14 @@ class StereoDrawingTracker:
                             f1 = pool.submit(_detect, lm1, frame1, ts)
                             res0, res1 = f0.result(), f1.result()
 
-                        tip0 = tip1 = None
+                        tip0 = tip1 = tip8 = tip12 = None
                         gesture = None
                         if res0.hand_landmarks:
-                            tip0 = _draw_hand(frame0, res0.hand_landmarks[0], w, h)
+                            hand = res0.hand_landmarks[0]
+                            tip0 = _draw_hand(frame0, hand, w, h)
+                            tip8 = hand[8]
+                            tip12 = hand[12]
+
                             if gesture_clf:
                                 gesture, conf = gesture_clf.classify(res0.hand_landmarks[0])
                                 if conf < GESTURE_CONFIDENCE:
@@ -531,8 +536,17 @@ class StereoDrawingTracker:
                         if res1.hand_landmarks:
                             tip1 = _draw_hand(frame1, res1.hand_landmarks[0], w, h)
 
-                        drawing = (gesture == "point") if gesture_clf else (tip0 is not None)
-                        erasing = (gesture == "fist") if gesture_clf else False
+                        #ADD NEW GESTURES HERE
+                        if gesture_clf:
+                            drawing  = (gesture == "point")
+                            resizing = (gesture == "peace")
+                            erasing  = (gesture == "fist")
+                        else:
+                            # Fallback: use tip presence, but keep modes exclusive
+                            resizing = False
+                            erasing  = False
+                            drawing  = (tip0 is not None) and not erasing
+                            
 
                         # Swipe detection — feed every frame, act only when open_hand
                         if res0.hand_landmarks and swipe_det:
@@ -591,11 +605,18 @@ class StereoDrawingTracker:
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
-                                    self._strokes.begin(color=PALETTE[self._color_idx])
+                                    self._strokes.begin(color=PALETTE[self._color_idx], max_radius=self._strokes.current_radius)
                                     self._start_drawing_doc()
                                 self._strokes.add_point(tip0[0], tip0[1], z)
                                 self._insert_point_doc(tip0[0], tip0[1], z)
                                 self._was_drawing = True
+                            elif resizing and tip0 and tip8 and tip12:
+                                PINCH_MAX = 0.25
+                                raw_dist = math.hypot(tip12.x - tip8.x, tip12.y - tip8.y)
+                                pinch_norm = 1.0 - min(raw_dist / PINCH_MAX, 1.0)
+                                self._strokes.current_radius = self._strokes._radius(pinch_norm)
+                                print(f"RESIZING: dist={raw_dist:.3f} norm={pinch_norm:.3f} radius={self._strokes.current_radius}")
+
                             else:
                                 if self._was_drawing:
                                     self._strokes.end()
