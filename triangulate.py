@@ -37,12 +37,9 @@ if _cal_path.exists():
     FOCAL_LENGTH_PX = (FOCAL_LEFT + FOCAL_RIGHT) / 2
     ANGLE_LEFT_DEG  = _cal.get("cam2", {}).get("toein_angle_deg", 0.0)
     ANGLE_RIGHT_DEG = _cal.get("cam1", {}).get("toein_angle_deg", 0.0)
-    print(f"[triangulate] left(cam2)  focal={FOCAL_LEFT:.1f}px  angle={ANGLE_LEFT_DEG:+.2f}°")
-    print(f"[triangulate] right(cam1) focal={FOCAL_RIGHT:.1f}px  angle={ANGLE_RIGHT_DEG:+.2f}°")
 else:
     FOCAL_LEFT = FOCAL_RIGHT = FOCAL_LENGTH_PX = 650.0
     ANGLE_LEFT_DEG = ANGLE_RIGHT_DEG = 0.0
-    print("[triangulate] no calibration.json — using defaults")
 
 
 def _derotate_x(x: float, focal: float, angle_deg: float) -> float:
@@ -60,16 +57,13 @@ def triangulate(
 
     disparity = x1 - x2
 
-    print(f"[tri] raw=({left_pt[0]:.0f},{right_pt[0]:.0f}) rect=({x1:.1f},{x2:.1f}) disp={disparity:.1f}")
 
     if abs(disparity) < MIN_DISPARITY_PX:
-        print(f"[tri] rejected: disparity too small")
         return None
 
     Z = (FOCAL_LENGTH_PX * BASELINE_INCHES) / disparity
 
     if not (Z_MIN_INCHES < Z < Z_MAX_INCHES):
-        print(f"[tri] rejected: Z={Z:.1f} out of range")
         return None
 
     X = (left_pt[0] - CX) * Z / FOCAL_LENGTH_PX
