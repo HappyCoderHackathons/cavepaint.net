@@ -121,6 +121,36 @@ class StereoDrawingTracker:
         with self.lock:
             self._color_idx = idx % len(PALETTE)
 
+    def add_mouse_stroke(self, points: list, color_idx: int):
+        """Commit a completed mouse-drawn stroke. points is a list of (x, y, z) tuples."""
+        if len(points) < 2:
+            return
+        color = PALETTE[color_idx % len(PALETTE)]
+        stroke = Stroke(
+            color=color,
+            max_radius=8,
+            min_radius=2,
+            _smooth_alpha=0.0,
+            _min_dist=1.0,
+        )
+        t0 = time.monotonic()
+        for i, pt in enumerate(points):
+            stroke.pts.append((float(pt[0]), float(pt[1]), float(pt[2])))
+            stroke.times.append(t0 + i * 0.016)
+        snapshot = None
+        with self.lock:
+            self._strokes._completed.append(stroke)
+            self._strokes._cache = None
+            self._canvas_version += 1
+            snapshot = {
+                "color_idx": self._color_idx,
+                "swipe_events": list(self._swipe_events),
+                "tracking": dict(self._tracking),
+                "canvas_version": self._canvas_version,
+            }
+        if snapshot is not None:
+            self._push_state(snapshot)
+
     def clear_canvas(self):
         with self.lock:
             self._strokes.clear()

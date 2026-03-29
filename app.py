@@ -194,6 +194,20 @@ async def set_color(request):
     return web.Response(status=204)
 
 
+async def mouse_stroke(request):
+    try:
+        data = await request.json()
+        raw_pts = data["points"]
+        color_idx = int(data.get("color_idx", 0))
+        if not isinstance(raw_pts, list) or len(raw_pts) < 2:
+            raise web.HTTPBadRequest(reason="Need at least 2 points")
+        points = [(float(p["x"]), float(p["y"]), float(p.get("z", 0.0))) for p in raw_pts]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise web.HTTPBadRequest(reason=str(exc))
+    await asyncio.to_thread(tracker.add_mouse_stroke, points, color_idx)
+    return web.Response(status=204)
+
+
 async def cameras(request):
     found = find_cameras()
     return web.Response(content_type="application/json", text=json.dumps(found))
@@ -298,6 +312,15 @@ async def api_session_frame(request):
 
 _POTATO_API = os.getenv("POTATO_API", "http://192.168.100.2:8080")
 
+async def api_motor_status(request):
+    try:
+        with urlopen(f"{_POTATO_API}/status", timeout=2) as resp:
+            return web.Response(content_type="application/json", text=resp.read().decode())
+    except URLError as exc:
+        return web.Response(status=502, content_type="application/json",
+                            text=json.dumps({"error": str(exc)}))
+
+
 async def api_rotate(request):
     try:
         if request.method == "POST":
@@ -340,6 +363,7 @@ app.router.add_get("/cameras", cameras)
 app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
+app.router.add_post("/stroke", mouse_stroke)
 app.router.add_get("/whiteboard.png", whiteboard)
 app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
 app.router.add_get("/gallery", gallery)
@@ -349,6 +373,7 @@ app.router.add_get("/api/sessions/{session_id}", api_session_info)
 app.router.add_get("/api/sessions/{session_id}/frame", api_session_frame)
 app.router.add_post("/api/rotate", api_rotate)
 app.router.add_get("/api/rotate", api_rotate)
+app.router.add_get("/api/motor_status", api_motor_status)
 app.router.add_static("/static/", STATIC_DIR, show_index=False)
 
 if __name__ == "__main__":

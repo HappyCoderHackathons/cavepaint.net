@@ -159,9 +159,15 @@
         <div class="w-full">
           <h2 class="font-display text-lg text-chalk sm:text-xl">Whiteboard Viewer</h2>
           <div class="mt-1 flex flex-wrap items-center justify-between gap-2">
-            <p class="text-xs text-orange-100/85 sm:text-sm">Drag left/right on the board to rotate your view.</p>
-            <div id="yawReadout" class="shrink-0 px-2 py-1 text-sm font-semibold text-chalk sm:text-base">
-              Yaw 0.0°
+            <p id="boardHint" class="text-xs text-orange-100/85 sm:text-sm">Drag left/right to rotate view.</p>
+            <div class="flex items-center gap-2">
+              <button
+                id="drawModeBtn"
+                class="rounded-full border border-stone-200/25 bg-gradient-to-b from-[#5a6f4a] via-[#3d5436] to-[#283820] px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-green-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_4px_12px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px"
+              >Draw</button>
+              <div id="yawReadout" class="shrink-0 px-2 py-1 text-sm font-semibold text-chalk sm:text-base">
+                Yaw 0.0°
+              </div>
             </div>
           </div>
         </div>
@@ -177,6 +183,11 @@
           class="h-full w-full object-fill"
           draggable="false"
         >
+        <canvas
+          id="drawCanvas"
+          class="pointer-events-none absolute inset-0 h-full w-full"
+          style="display:none"
+        ></canvas>
         <div class="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-black/10 to-transparent"></div>
       </div>
     </section>
@@ -281,37 +292,220 @@
     rotateLeftBtn.addEventListener("click", () => rotate(-1));
     rotateRightBtn.addEventListener("click", () => rotate(1));
 
+    // -----------------------------------------------------------------------
+    // Auto-center: rotate mount to keep hand in frame center
+    // -----------------------------------------------------------------------
+    const FRAME_WIDTH   = 640;
+    const CENTER_X      = FRAME_WIDTH / 2;
+    const DEAD_ZONE_PX  = 60;   // ignore offsets smaller than this
+    const MAX_STEP_DEG  = 25;   // max degrees per correction step
+    const MIN_STEP_DEG  = 3;    // minimum meaningful step
+    const POLL_MS       = 300;  // how often to check motor status after a move
+
+    let autoCenterEnabled = false;
+    let motorBusy = false;
+    let lastHandX = null;
+
+    const autoCenterBtn = document.createElement("button");
+    autoCenterBtn.id = "autoCenterBtn";
+    autoCenterBtn.textContent = "Auto-Center: OFF";
+    autoCenterBtn.className = "rounded-full border border-stone-200/25 bg-gradient-to-b from-[#4a7f5a] via-[#345c3d] to-[#1e3a26] px-4 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-green-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_6px_16px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px sm:text-base opacity-50";
+    rotateRightBtn.after(autoCenterBtn);
+
+    autoCenterBtn.addEventListener("click", () => {
+      autoCenterEnabled = !autoCenterEnabled;
+      autoCenterBtn.textContent = `Auto-Center: ${autoCenterEnabled ? "ON" : "OFF"}`;
+      autoCenterBtn.style.opacity = autoCenterEnabled ? "1" : "0.5";
+    });
+
+    async function waitForMotor() {
+      while (true) {
+        try {
+          const r = await fetch("/api/motor_status");
+          const s = await r.json();
+          if (!s.rotating) break;
+        } catch (_) { break; }
+        await new Promise(res => setTimeout(res, POLL_MS));
+      }
+      motorBusy = false;
+    }
+
+    function tryAutoCenter(handX) {
+      if (!autoCenterEnabled || motorBusy || handX == null) return;
+      const offset = handX - CENTER_X;
+      if (Math.abs(offset) <= DEAD_ZONE_PX) return;
+
+      // Opposite direction: hand right of center → rotate right (positive)
+      const raw = (offset / (CENTER_X - DEAD_ZONE_PX)) * MAX_STEP_DEG;
+      const deg = Math.sign(raw) * Math.max(MIN_STEP_DEG, Math.min(MAX_STEP_DEG, Math.abs(raw)));
+
+      motorBusy = true;
+      fetch("/api/rotate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ degrees: deg }),
+      }).then(r => r.json()).then(res => {
+        if (res.error === "already rotating") motorBusy = false;
+        else waitForMotor();
+      }).catch(() => { motorBusy = false; });
+    }
+
+    // Hook into applyState to pick up hand position
+    const _origApplyState = applyState;
+    applyState = function(data) {
+      _origApplyState(data);
+      const tip = (data.tracking || {}).tip0;
+      if (tip) { lastHandX = tip[0]; tryAutoCenter(lastHandX); }
+    };
+
+    // -----------------------------------------------------------------------
+    // Draw mode
+    // -----------------------------------------------------------------------
+    const drawModeBtn = document.getElementById("drawModeBtn");
+    const drawCanvas = document.getElementById("drawCanvas");
+    const boardHint = document.getElementById("boardHint");
+    let drawMode = false;
+    let drawing = false;
+    let currentStroke = [];
+
+    function setDrawMode(on) {
+      drawMode = on;
+      drawModeBtn.textContent = on ? "View" : "Draw";
+      boardHint.textContent = on
+        ? "Click and drag to draw on the whiteboard."
+        : "Drag left/right to rotate view.";
+      boardSurface.style.cursor = on ? "crosshair" : "";
+      drawCanvas.style.display = on ? "block" : "none";
+      if (!on) clearDrawCanvas();
+    }
+
+    drawModeBtn.addEventListener("click", () => setDrawMode(!drawMode));
+
+    function resizeDrawCanvas() {
+      const rect = boardSurface.getBoundingClientRect();
+      drawCanvas.width = rect.width;
+      drawCanvas.height = rect.height;
+    }
+    window.addEventListener("resize", () => { resizeDrawCanvas(); markBoardDirty(); });
+    resizeDrawCanvas();
+
+    function clearDrawCanvas() {
+      const ctx = drawCanvas.getContext("2d");
+      ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    }
+
+    function unprojectPoint(u, v, yaw_deg, fov_deg, W, H) {
+      const yaw_rad = yaw_deg * Math.PI / 180;
+      const fov_rad = fov_deg * Math.PI / 180;
+      const focal = (W / 2) / Math.tan(fov_rad / 2);
+      const c = Math.cos(yaw_rad), s = Math.sin(yaw_rad);
+      const kx = (u - W / 2) / focal;
+      const ky = (v - H / 2) / focal;
+      const denom = c + kx * s;
+      if (Math.abs(denom) < 1e-6) return null;
+      const xw = 400 * (kx * c - s) / denom;
+      const zr = -s * xw + c * 400;
+      const yw = ky * zr;
+      return { x: xw + 320, y: yw + 240, z: 0 };
+    }
+
+    function getActiveColor() {
+      if (palette.length > 0) {
+        return palette[activeColorIdx] || "#000";
+      }
+      return "#000";
+    }
+
     boardSurface.addEventListener("pointerdown", (event) => {
-      dragging = true;
-      dragStartX = event.clientX;
-      dragStartYaw = yaw;
-      boardSurface.setPointerCapture(event.pointerId);
+      if (drawMode) {
+        drawing = true;
+        currentStroke = [];
+        resizeDrawCanvas();
+        const rect = boardSurface.getBoundingClientRect();
+        const u = event.clientX - rect.left;
+        const v = event.clientY - rect.top;
+        const pt = unprojectPoint(u, v, normalize360(yaw), fov, rect.width, rect.height);
+        if (pt) currentStroke.push({ screenPt: [u, v], worldPt: pt });
+        boardSurface.setPointerCapture(event.pointerId);
+      } else {
+        dragging = true;
+        dragStartX = event.clientX;
+        dragStartYaw = yaw;
+        boardSurface.setPointerCapture(event.pointerId);
+      }
     });
 
     boardSurface.addEventListener("pointermove", (event) => {
-      if (!dragging) return;
-      const deltaX = event.clientX - dragStartX;
-      yaw = normalize360(dragStartYaw + deltaX * 0.22);
-      syncLabels();
-      markBoardDirty();
+      if (drawMode) {
+        if (!drawing) return;
+        const rect = boardSurface.getBoundingClientRect();
+        const u = event.clientX - rect.left;
+        const v = event.clientY - rect.top;
+        const pt = unprojectPoint(u, v, normalize360(yaw), fov, rect.width, rect.height);
+        if (pt) {
+          currentStroke.push({ screenPt: [u, v], worldPt: pt });
+          // Draw preview on canvas
+          const ctx = drawCanvas.getContext("2d");
+          ctx.strokeStyle = getActiveColor();
+          ctx.lineWidth = 4;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          if (currentStroke.length >= 2) {
+            const prev = currentStroke[currentStroke.length - 2].screenPt;
+            const cur = currentStroke[currentStroke.length - 1].screenPt;
+            ctx.beginPath();
+            ctx.moveTo(prev[0], prev[1]);
+            ctx.lineTo(cur[0], cur[1]);
+            ctx.stroke();
+          }
+        }
+      } else {
+        if (!dragging) return;
+        const deltaX = event.clientX - dragStartX;
+        yaw = normalize360(dragStartYaw + deltaX * 0.22);
+        syncLabels();
+        markBoardDirty();
+      }
     });
 
-    function stopDrag(event) {
-      if (dragging) {
-        dragging = false;
-        if (typeof event.pointerId === "number") {
-          boardSurface.releasePointerCapture(event.pointerId);
+    async function commitStroke() {
+      if (currentStroke.length < 2) { currentStroke = []; clearDrawCanvas(); return; }
+      const points = currentStroke.map(s => s.worldPt);
+      currentStroke = [];
+      clearDrawCanvas();
+      try {
+        await fetch("/stroke", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ points, color_idx: activeColorIdx }),
+        });
+      } finally {
+        markBoardDirty();
+        refreshWhiteboard();
+      }
+    }
+
+    function stopInteraction(event) {
+      if (drawMode) {
+        if (drawing) {
+          drawing = false;
+          if (typeof event.pointerId === "number") boardSurface.releasePointerCapture(event.pointerId);
+          commitStroke();
+        }
+      } else {
+        if (dragging) {
+          dragging = false;
+          if (typeof event.pointerId === "number") boardSurface.releasePointerCapture(event.pointerId);
         }
       }
     }
 
-    boardSurface.addEventListener("pointerup", stopDrag);
-    boardSurface.addEventListener("pointercancel", stopDrag);
+    boardSurface.addEventListener("pointerup", stopInteraction);
+    boardSurface.addEventListener("pointercancel", stopInteraction);
     boardSurface.addEventListener("lostpointercapture", () => {
       dragging = false;
+      if (drawing) { drawing = false; commitStroke(); }
     });
-
-    window.addEventListener("resize", markBoardDirty);
 
     // Fallback poll — covers initial load and SSE reconnect gaps
     setInterval(() => {
