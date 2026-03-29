@@ -1,11 +1,12 @@
 """MongoDB connection, collection handles, and related config."""
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 _uri = os.getenv("MONGO_URI")
 
@@ -29,7 +30,7 @@ actions_col  = None
 
 if _uri:
     try:
-        _client = MongoClient(_uri, serverSelectionTimeoutMS=2000)
+        _client = MongoClient(_uri, serverSelectionTimeoutMS=10000)
         _db = _client["cavepainting"]
         drawings_col = _db["drawings"]
         points_col   = _db["points"]

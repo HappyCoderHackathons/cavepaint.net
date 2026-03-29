@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cave Gallery</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            cave0: "#160f0a",
+            cave1: "#2a1d13",
+            clay: "#9e6b3d",
+            chalk: "#f1e4cf",
+            ember: "#e56a2e",
+          },
+          fontFamily: {
+            display: ["Cinzel", "serif"],
+            body: ["Manrope", "ui-sans-serif", "system-ui"],
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="min-h-screen bg-cave0 font-body text-chalk">
+
+  <div class="pointer-events-none fixed inset-0 opacity-20"
+    style="background:radial-gradient(circle at 15% 20%, rgba(229,106,46,0.35), transparent 40%),
+           radial-gradient(circle at 80% 10%, rgba(158,107,61,0.22), transparent 40%);"></div>
+  <img src="/static/images/cave_wall.jpg" alt=""
+    class="pointer-events-none fixed inset-0 z-0 h-full w-full object-cover opacity-[0.15]"
+    draggable="false">
+
+  <main class="relative z-10 mx-auto max-w-7xl px-5 py-8 sm:px-8">
+
+    <!-- Header -->
+    <header class="mb-8 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <img src="/static/images/cave_man_2.png" alt="Caveman"
+          class="h-14 w-14 object-contain drop-shadow-[0_6px_18px_rgba(0,0,0,0.6)]"
+          draggable="false">
+        <div>
+          <h1 class="font-display text-3xl text-orange-100 drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)] sm:text-5xl">
+            Cave Gallery
+          </h1>
+          <p class="text-xs uppercase tracking-widest text-orange-100/55">Ancient paintings, preserved</p>
+        </div>
+      </div>
+      <a href="/" class="rounded-full border border-stone-200/20 bg-cave1/70 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-chalk/70 transition hover:text-chalk">
+        ← Live Cave
+      </a>
+    </header>
+
+    <!-- States -->
+    <div id="loadingState" class="flex flex-col items-center gap-4 py-24 text-center">
+      <div class="h-8 w-8 animate-spin rounded-full border-2 border-ember border-t-transparent"></div>
+      <p class="text-sm uppercase tracking-widest text-orange-100/50">Unearthing paintings…</p>
+    </div>
+
+    <div id="emptyState" class="hidden flex-col items-center gap-4 py-24 text-center">
+      <img src="/static/images/cave_man_2.png" alt="" class="h-20 w-20 object-contain opacity-30" draggable="false">
+      <p class="font-display text-xl text-orange-100/50">No paintings yet</p>
+      <p class="text-sm text-orange-100/35">Start drawing to create a session.</p>
+    </div>
+
+    <div id="errorState" class="hidden flex-col items-center gap-4 py-24 text-center">
+      <p class="font-display text-xl text-orange-100/50">MongoDB not connected</p>
+      <p class="text-sm text-orange-100/35">Set MONGO_URI to enable the gallery.</p>
+    </div>
+
+    <!-- Grid -->
+    <div id="grid" class="hidden grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3"></div>
+
+  </main>
+
+  <script>
+    const grid        = document.getElementById("grid");
+    const loadingState = document.getElementById("loadingState");
+    const emptyState  = document.getElementById("emptyState");
+    const errorState  = document.getElementById("errorState");
+
+    function showOnly(el) {
+      [loadingState, emptyState, errorState].forEach(e => e.classList.add("hidden"));
+      grid.classList.add("hidden");
+      el.classList.remove("hidden");
+      if (el === grid) el.classList.add("grid");
+    }
+
+    function formatDate(iso) {
+      if (!iso) return "Unknown date";
+      try {
+        return new Date(iso).toLocaleString(undefined, {
+          month: "short", day: "numeric", year: "numeric",
+          hour: "2-digit", minute: "2-digit",
+        });
+      } catch (_) { return iso; }
+    }
+
+    function formatDuration(s) {
+      if (s == null) return "—";
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+    }
+
+    function buildCard(session) {
+      const sid = session.session_id;
+      const thumbUrl = `/api/sessions/${encodeURIComponent(sid)}/frame?t=999999&w=480&h=160`;
+
+      const card = document.createElement("a");
+      card.href = `/replay/${encodeURIComponent(sid)}`;
+      card.className = [
+        "group block overflow-hidden rounded-sm border border-stone-700/40",
+        "bg-cave1/60 shadow-[0_12px_40px_rgba(0,0,0,0.4)]",
+        "transition hover:border-ember/40 hover:shadow-[0_16px_50px_rgba(229,106,46,0.18)]",
+      ].join(" ");
+
+      card.innerHTML = `
+        <div class="relative overflow-hidden bg-[#f5ede0]" style="height:160px;">
+          <img
+            src="${thumbUrl}"
+            alt="Session thumbnail"
+            loading="lazy"
+            class="h-full w-full object-fill transition duration-300 group-hover:scale-[1.02]"
+            draggable="false"
+          >
+          <div class="pointer-events-none absolute inset-x-0 bottom-0 h-8
+                      bg-gradient-to-t from-cave1/70 to-transparent"></div>
+          <div class="absolute right-2 top-2 rounded-full bg-cave0/70 px-2 py-0.5
+                      text-[10px] font-semibold uppercase tracking-widest text-ember backdrop-blur-sm">
+            ▶ Replay
+          </div>
+        </div>
+        <div class="px-4 py-3">
+          <p class="text-sm font-semibold text-chalk">${formatDate(session.started_at)}</p>
+          <div class="mt-1.5 flex flex-wrap items-center gap-3 text-[11px] text-orange-100/55">
+            <span>⏱ ${formatDuration(session.duration_s)}</span>
+            <span>✏️ ${session.stroke_count.toLocaleString()} pts</span>
+            <span>🖌 ${session.drawing_count} strokes</span>
+          </div>
+        </div>
+      `;
+      return card;
+    }
+
+    async function loadGallery() {
+      try {
+        const resp = await fetch("/api/sessions");
+        const data = await resp.json();
+
+        if (data.error) { showOnly(errorState); return; }
+        if (!Array.isArray(data) || data.length === 0) { showOnly(emptyState); return; }
+
+        data.forEach(s => grid.appendChild(buildCard(s)));
+        showOnly(grid);
+      } catch (_) {
+        showOnly(errorState);
+      }
+    }
+
+    loadGallery();
+  </script>
+</body>
+</html>

@@ -12,6 +12,8 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 
 from stereo_drawing import PALETTE, StereoDrawingTracker, find_cameras
+from stereo_drawing.mongo import drawings_col, points_col, erases_col
+from session_store import SessionStore
 
 # Convert BGR palette to CSS hex for the frontend
 PALETTE_HEX = ["#{:02x}{:02x}{:02x}".format(r, g, b) for b, g, r in PALETTE]
@@ -62,10 +64,18 @@ tracker.start()
 
 pcs: set[RTCPeerConnection] = set()
 
-TEMPLATE = (Path(__file__).parent / "templates" / "stream.html").read_text()
-STUDENT_TEMPLATE = (Path(__file__).parent / "templates" / "student.html").read_text()
+TEMPLATE = (Path(__file__).parent / "templates" / "stream.html").read_text(encoding="utf-8")
+STUDENT_TEMPLATE = (Path(__file__).parent / "templates" / "student.html").read_text(encoding="utf-8")
+GALLERY_TEMPLATE = (Path(__file__).parent / "templates" / "gallery.html").read_text(encoding="utf-8")
+REPLAY_TEMPLATE = (Path(__file__).parent / "templates" / "replay.html").read_text(encoding="utf-8")
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+session_store = (
+    SessionStore(drawings_col, points_col, erases_col)
+    if drawings_col is not None
+    else None
+)
 
 
 async def index(request):
@@ -224,6 +234,62 @@ async def whiteboard_jpg(request):
     return await _render_whiteboard_response(request, "jpg")
 
 
+async def gallery(request):
+    return web.Response(content_type="text/html", text=GALLERY_TEMPLATE)
+
+
+async def replay_page(request):
+    return web.Response(content_type="text/html", text=REPLAY_TEMPLATE)
+
+
+async def api_sessions(request):
+    if session_store is None:
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({"error": "MongoDB not configured"}),
+        )
+    sessions = await asyncio.to_thread(session_store.list_sessions)
+    return web.Response(content_type="application/json", text=json.dumps(sessions))
+
+
+async def api_session_info(request):
+    sid = request.match_info["session_id"]
+    if session_store is None:
+        raise web.HTTPServiceUnavailable(reason="MongoDB not configured")
+    info = await asyncio.to_thread(session_store.get_session_info, sid)
+    if info is None:
+        raise web.HTTPNotFound()
+    return web.Response(content_type="application/json", text=json.dumps(info))
+
+
+async def api_session_frame(request):
+    sid = request.match_info["session_id"]
+    try:
+        t_offset = float(request.query.get("t", "0"))
+        yaw = float(request.query.get("yaw", "0"))
+        fov = float(request.query.get("fov", "80"))
+        width = int(request.query.get("w", "960"))
+        height = int(request.query.get("h", "260"))
+    except ValueError:
+        raise web.HTTPBadRequest(reason="Invalid query params")
+    if session_store is None:
+        raise web.HTTPServiceUnavailable(reason="MongoDB not configured")
+    ops = await asyncio.to_thread(session_store.build_ops_at, sid, t_offset)
+    frame = await asyncio.to_thread(
+        tracker.render_ops, ops, yaw_deg=yaw, fov_deg=fov, width=width, height=height
+    )
+    ok, encoded = await asyncio.to_thread(
+        cv2.imencode, ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88]
+    )
+    if not ok:
+        raise web.HTTPInternalServerError(reason="Encode failed")
+    return web.Response(
+        body=encoded.tobytes(),
+        content_type="image/jpeg",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 async def on_shutdown(app):
     tracker.stop()
     await asyncio.gather(*[pc.close() for pc in pcs])
@@ -243,6 +309,11 @@ app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_get("/whiteboard.png", whiteboard)
 app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
+app.router.add_get("/gallery", gallery)
+app.router.add_get("/replay/{session_id}", replay_page)
+app.router.add_get("/api/sessions", api_sessions)
+app.router.add_get("/api/sessions/{session_id}", api_session_info)
+app.router.add_get("/api/sessions/{session_id}/frame", api_session_frame)
 app.router.add_static("/static/", STATIC_DIR, show_index=False)
 
 if __name__ == "__main__":

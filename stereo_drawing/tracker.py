@@ -166,6 +166,16 @@ class StereoDrawingTracker:
     # ------------------------------------------------------------------
 
     def render_whiteboard(self, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
+        ops = None
+        if self._mongo_whiteboard is not None:
+            ops = self._mongo_whiteboard.load_state()
+        if ops is None or len(ops) == 0:
+            with self.lock:
+                ops = [{"kind": "stroke", "stroke": s} for s in self._snapshot_strokes()]
+        return self.render_ops(ops, yaw_deg=yaw_deg, fov_deg=fov_deg, width=width, height=height)
+
+    def render_ops(self, ops, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
+        """Render an arbitrary ops list (strokes + erases) to a board image."""
         width = int(np.clip(width, 320, 1920))
         height = int(np.clip(height, 120, 1080))
         yaw_deg = float(yaw_deg) % 360.0
@@ -173,20 +183,9 @@ class StereoDrawingTracker:
         yaw_rad = float(np.deg2rad(yaw_deg))
         fov_rad = float(np.deg2rad(fov_deg))
 
-        ops = None
-        if self._mongo_whiteboard is not None:
-            ops = self._mongo_whiteboard.load_state()
-
-        if ops is None or len(ops) == 0:
-            with self.lock:
-                ops = [{"kind": "stroke", "stroke": s} for s in self._snapshot_strokes()]
-
         def project(px, py, pz):
             return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
 
-        # Match live render semantics:
-        # draw strokes on a black layer, erase by overdrawing black circles on that layer,
-        # then composite non-black pixels onto a white board background.
         stroke_layer = np.zeros((height, width, 3), dtype=np.uint8)
         for op in ops:
             if op.get("kind") == "stroke":
@@ -200,8 +199,6 @@ class StereoDrawingTracker:
                 cy = float(op.get("y", 0.0))
                 cz = float(op.get("z", 0.0))
                 cr = float(op.get("radius", 30.0))
-                # Anchor erase at measured depth for accurate alignment, and sweep a
-                # small depth neighborhood so nearby z-layers are also cleared.
                 for ez in (cz - 4.0, cz, cz + 4.0):
                     center = self._project_whiteboard_point(cx, cy, ez, yaw_rad, fov_rad, width, height)
                     if center is None:
@@ -219,7 +216,6 @@ class StereoDrawingTracker:
         board = self._get_whiteboard_base(width, height, yaw_deg).copy()
         ink_mask = stroke_layer.any(axis=2)
         board[ink_mask] = stroke_layer[ink_mask]
-
         return board
 
     def _load_stone_texture(self):
