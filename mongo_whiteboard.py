@@ -274,3 +274,14 @@ class MongoWhiteboardReplay:
         if ops is None:
             return None
         return [op["stroke"] for op in ops if op.get("kind") == "stroke"]
+
+    def invalidate(self) -> None:
+        """Force next load_state() to rebuild from Mongo (handles undo/delete)."""
+        with self._lock:
+            self._initialized = False
+            self._last_point_id = None
+            self._last_erase_id = None
+            self._active_by_drawing = {}
+            self._timeline_ops = []
+            self._state_snapshot = []
+            self._next_refresh_at = 0.0
