@@ -96,6 +96,26 @@ async def cameras(request):
     return web.Response(content_type="application/json", text=json.dumps(found))
 
 
+async def whiteboard(request):
+    try:
+        yaw = float(request.query.get("yaw", "0"))
+        fov = float(request.query.get("fov", "80"))
+        width = int(request.query.get("w", "960"))
+        height = int(request.query.get("h", "260"))
+    except ValueError:
+        raise web.HTTPBadRequest(reason="Invalid whiteboard query params")
+
+    frame = tracker.render_whiteboard(yaw_deg=yaw, fov_deg=fov, width=width, height=height)
+    ok, encoded = cv2.imencode(".png", frame)
+    if not ok:
+        raise web.HTTPInternalServerError(reason="Failed to encode whiteboard image")
+    return web.Response(
+        body=encoded.tobytes(),
+        content_type="image/png",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 async def on_shutdown(app):
     tracker.stop()
     await asyncio.gather(*[pc.close() for pc in pcs])
@@ -109,6 +129,7 @@ app.router.add_post("/offer", offer)
 app.router.add_post("/clear", clear)
 app.router.add_post("/undo", undo)
 app.router.add_get("/cameras", cameras)
+app.router.add_get("/whiteboard.png", whiteboard)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
