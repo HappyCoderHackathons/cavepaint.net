@@ -846,6 +846,8 @@ class StereoDrawingTracker:
         _last_person_mask = None
         _small_radius_lock_px = 16
         _small_radius_lock_sec = 0.8
+        _opposite_swipe_lock_sec = 0.70
+        _swipe_block_until = {"swipe_left": 0.0, "swipe_right": 0.0}
         _prev_action = "idle"
         _pose_throttle = max(1, int(os.getenv("POSE_THROTTLE", "3")))
         _pose_frame_idx = 0
@@ -946,13 +948,26 @@ class StereoDrawingTracker:
                 swipe = swipe_det.update(palm_x, palm_y, palm_sc)
                 if swipe and gesture == "open_hand":
                     label, _ = swipe
+                    now_mono = time.monotonic()
+                    accepted_swipe = False
                     if label == "swipe_right":
-                        self._color_idx = (self._color_idx + 1) % len(PALETTE)
+                        if now_mono < _swipe_block_until["swipe_right"]:
+                            label = None
+                        else:
+                            self._color_idx = (self._color_idx + 1) % len(PALETTE)
+                            _swipe_block_until["swipe_left"] = now_mono + _opposite_swipe_lock_sec
+                            accepted_swipe = True
                     elif label == "swipe_left":
-                        self._color_idx = (self._color_idx - 1) % len(PALETTE)
+                        if now_mono < _swipe_block_until["swipe_left"]:
+                            label = None
+                        else:
+                            self._color_idx = (self._color_idx - 1) % len(PALETTE)
+                            _swipe_block_until["swipe_right"] = now_mono + _opposite_swipe_lock_sec
+                            accepted_swipe = True
                     elif label == "swipe_up":
                         submit_swipe_up = True
-                    if label in ("swipe_left", "swipe_right", "swipe_up"):
+                        accepted_swipe = True
+                    if accepted_swipe and label in ("swipe_left", "swipe_right", "swipe_up"):
                         swipe_events.append((label, self._color_idx, SWIPE_DISPLAY_FRAMES))
 
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
