@@ -216,7 +216,7 @@ class StrokeStore:
         self._active: Stroke | None = None
         self._cache: np.ndarray | None = None
         self._erase_canvas: np.ndarray | None = None
-        self._erase_ops: list[tuple[float, float, float]] = []
+        self._erase_ops: list[tuple[float, float, float, float]] = []
         self._dirty = False
         self._pixel_edited = False
         self.min_radius = 5
@@ -291,11 +291,11 @@ class StrokeStore:
     #     if len(self._completed) != before:
     #         self._dirty = True
 
-    def erase_near(self, x: float, y: float, radius: float = 40.0):
+    def erase_near(self, x: float, y: float, radius: float = 40.0, z: float = 0.0):
         pt = (int(x), int(y))
         r  = int(radius)
         # Record op so render_layered can replay it without needing _cache
-        self._erase_ops.append((float(x), float(y), float(radius)))
+        self._erase_ops.append((float(x), float(y), float(radius), float(z)))
         if self._cache is not None:
             cv2.circle(self._cache, pt, r, (0, 0, 0), -1, cv2.LINE_AA)
             self._pixel_edited = True
@@ -346,10 +346,9 @@ class StrokeStore:
         if active_layer == "infront":
             self._active.render(infront, project)
 
-        # Replay erase ops onto both layers
-        for ex, ey, er in self._erase_ops:
-            cv2.circle(behind,  (int(ex), int(ey)), int(er), (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(infront, (int(ex), int(ey)), int(er), (0, 0, 0), -1, cv2.LINE_AA)
+        # Replay erase ops onto both layers.
+        self._apply_erase_ops(behind, project=project)
+        self._apply_erase_ops(infront, project=project)
 
         return behind, infront
 
@@ -358,6 +357,16 @@ class StrokeStore:
 
         project(x, y, z) -> (px, py) | None  for 3D -> 2D projection.
         """
+        if project is not None:
+            # Projection depends on camera/view parameters; bypass 2D cache.
+            canvas = np.zeros(shape, dtype=np.uint8)
+            for s in self._completed:
+                s.render(canvas, project)
+            if self._active and not self._active.empty():
+                self._active.render(canvas, project)
+            self._apply_erase_ops(canvas, project=project)
+            return canvas
+
         if self._cache is None or self._cache.shape != shape or (self._dirty and not self._pixel_edited):
             self._cache = np.zeros(shape, dtype=np.uint8)
             for s in self._completed:
@@ -385,3 +394,27 @@ class StrokeStore:
             else:
                 self._dirty = True
         self._active = None
+
+    def _apply_erase_ops(self, canvas: np.ndarray, project=None):
+        for op in self._erase_ops:
+            if len(op) == 4:
+                ex, ey, er, ez = op
+            else:
+                ex, ey, er = op
+                ez = 0.0
+
+            if project is None:
+                center = (int(ex), int(ey))
+                draw_r = int(er)
+            else:
+                c0 = project(ex, ey, ez)
+                if c0 is None:
+                    continue
+                c1 = project(ex + float(er), ey, ez)
+                if c1 is None:
+                    draw_r = int(max(1, round(float(er))))
+                else:
+                    draw_r = int(max(1, round(np.hypot(c1[0] - c0[0], c1[1] - c0[1]))))
+                center = (int(round(c0[0])), int(round(c0[1])))
+
+            cv2.circle(canvas, center, int(max(1, draw_r)), (0, 0, 0), -1, cv2.LINE_AA)

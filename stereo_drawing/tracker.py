@@ -82,6 +82,8 @@ class StereoDrawingTracker:
         self._stone_texture = self._load_stone_texture()
         self._board_base_cache_unshifted = None
         self._board_base_cache_size = None
+        self._live_yaw_deg = 0.0
+        self._live_fov_deg = 80.0
         print(f"[session] Drawing session: {self._session_id}")
 
     # ------------------------------------------------------------------
@@ -115,11 +117,19 @@ class StereoDrawingTracker:
                 "swipe_events": list(self._swipe_events),
                 "tracking": dict(self._tracking),
                 "canvas_version": self._canvas_version,
+                "live_yaw_deg": self._live_yaw_deg,
             }
 
     def set_color(self, idx: int):
         with self.lock:
             self._color_idx = idx % len(PALETTE)
+
+    def set_live_view(self, yaw_deg: float | None = None, fov_deg: float | None = None):
+        with self.lock:
+            if yaw_deg is not None:
+                self._live_yaw_deg = float(yaw_deg) % 360.0
+            if fov_deg is not None:
+                self._live_fov_deg = float(np.clip(fov_deg, 30.0, 150.0))
 
     def add_mouse_stroke(self, points: list, color_idx: int):
         """Commit a completed mouse-drawn stroke. points is a list of (x, y, z) tuples."""
@@ -137,10 +147,13 @@ class StereoDrawingTracker:
         for i, pt in enumerate(points):
             stroke.pts.append((float(pt[0]), float(pt[1]), float(pt[2])))
             stroke.times.append(t0 + i * 0.016)
+        persisted_to_mongo = self._persist_mouse_stroke(stroke)
         snapshot = None
         with self.lock:
             self._strokes._completed.append(stroke)
             self._strokes._cache = None
+            if persisted_to_mongo and self._mongo_whiteboard is not None:
+                self._mongo_whiteboard.invalidate()
             self._canvas_version += 1
             snapshot = {
                 "color_idx": self._color_idx,
@@ -421,6 +434,92 @@ class StereoDrawingTracker:
     # ------------------------------------------------------------------
     # MongoDB helpers
     # ------------------------------------------------------------------
+
+    def _persist_mouse_stroke(self, stroke: Stroke) -> bool:
+        """Persist a completed mouse stroke without mutating active hand-drawing state."""
+        if not self._mongo_enabled:
+            return False
+
+        now = self._utcnow()
+        brush_radius = int(max(1, round(float(getattr(stroke, "max_radius", 8)))))
+        drawing_doc = {
+            "createdAt": now,
+            "updatedAt": now,
+            "endedAt": now,
+            "status": "completed",
+            "pointCount": len(stroke.pts),
+            "color": self._serialize_color(stroke.color),
+            "rigRotationDeg": 0,
+            "sessionId": self._session_id,
+            "brushRadius": brush_radius,
+        }
+
+        try:
+            drawing_result = drawings_col.insert_one(drawing_doc)
+            drawing_id = drawing_result.inserted_id
+        except PyMongoError as exc:
+            print(f"[mongo] mouse drawing insert failed: {exc}")
+            return False
+
+        action_id = None
+        if actions_col is not None:
+            try:
+                action_doc = {
+                    "sessionId": self._session_id,
+                    "kind": "draw",
+                    "drawingId": drawing_id,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "endedAt": now,
+                    "status": "completed",
+                }
+                action_id = actions_col.insert_one(action_doc).inserted_id
+            except PyMongoError as exc:
+                print(f"[mongo] mouse draw action insert failed: {exc}")
+                action_id = None
+
+        if action_id is not None:
+            try:
+                drawings_col.update_one(
+                    {"_id": drawing_id},
+                    {"$set": {"actionId": action_id}},
+                )
+            except PyMongoError as exc:
+                print(f"[mongo] mouse drawing action link failed: {exc}")
+
+        point_docs = []
+        base_t = float(now.timestamp())
+        serialized_color = self._serialize_color(stroke.color)
+        for i, (x, y, z) in enumerate(stroke.pts):
+            point_docs.append({
+                "drawingId": drawing_id,
+                "seq": i,
+                "t": base_t + i * 0.016,
+                "position": {"x": float(x), "y": float(y), "z": float(z)},
+                "rigRotationDeg": 0,
+                "color": serialized_color,
+                "brushRadius": brush_radius,
+                "sessionId": self._session_id,
+            })
+
+        written_points = 0
+        if point_docs:
+            try:
+                result = points_col.insert_many(point_docs, ordered=True)
+                written_points = len(result.inserted_ids)
+            except PyMongoError as exc:
+                print(f"[mongo] mouse point batch insert failed: {exc}")
+
+        if written_points != len(point_docs):
+            try:
+                drawings_col.update_one(
+                    {"_id": drawing_id},
+                    {"$set": {"pointCount": written_points, "updatedAt": self._utcnow()}},
+                )
+            except PyMongoError as exc:
+                print(f"[mongo] mouse drawing pointCount reconcile failed: {exc}")
+
+        return written_points > 0
 
     def _start_drawing_doc(self, color="black", brush_radius=None):
         if not self._mongo_enabled:
@@ -1003,6 +1102,18 @@ class StereoDrawingTracker:
             z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
+                live_yaw_deg = float(self._live_yaw_deg) % 360.0
+                live_fov_deg = float(np.clip(self._live_fov_deg, 30.0, 150.0))
+                live_yaw_signed = live_yaw_deg if live_yaw_deg <= 180.0 else (live_yaw_deg - 360.0)
+                use_projected_live = abs(live_yaw_signed) > 0.05
+                live_project = None
+                if use_projected_live:
+                    yaw_rad = float(np.deg2rad(live_yaw_deg))
+                    fov_rad = float(np.deg2rad(live_fov_deg))
+
+                    def live_project(px, py, pz):
+                        return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, w, h)
+
                 if submit_swipe_up:
                     self._submit_and_start_new_session()
                     self._canvas_version += 1
@@ -1022,7 +1133,7 @@ class StereoDrawingTracker:
                         # transition can leave the new stroke out of the cached canvas.
                         self._strokes.render(frame0.shape)
                     erase_radius = self._strokes.current_radius
-                    self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
+                    self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius, z=z)
                     self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
                     self._was_drawing = False
                     self._was_erasing = True
@@ -1094,17 +1205,21 @@ class StereoDrawingTracker:
 
                 if person_mask is not None and person_z is not None:
                     # Depth-sorted composite: bg strokes → person (alpha) → fg strokes
-                    bg_strokes, fg_strokes = self._strokes.render_layered(frame0.shape, person_z)
+                    bg_strokes, fg_strokes = self._strokes.render_layered(
+                        frame0.shape,
+                        person_z,
+                        project=live_project,
+                    )
 
                     frame0 = apply_strokes(frame0, bg_strokes)
                     frame0 = alpha_composite(frame0, raw_frame, person_mask)
                     frame0 = apply_strokes(frame0, fg_strokes)
                 elif person_mask is not None:
-                    stroke_canvas = self._strokes.render(frame0.shape)
+                    stroke_canvas = self._strokes.render(frame0.shape, project=live_project)
                     frame0 = apply_strokes(frame0, stroke_canvas)
                     frame0 = alpha_composite(frame0, raw_frame, person_mask)
                 else:
-                    stroke_canvas = self._strokes.render(frame0.shape)
+                    stroke_canvas = self._strokes.render(frame0.shape, project=live_project)
                     frame0 = apply_strokes(frame0, stroke_canvas)
 
                 if erasing and tip0:
@@ -1120,6 +1235,7 @@ class StereoDrawingTracker:
                     "gesture": gesture,
                     "fps": round(_fps, 1),
                     "brush_radius": self._strokes.current_radius,
+                    "live_yaw": round(live_yaw_deg, 1),
                 }
                 self.output_frame = frame0
                 _push = {

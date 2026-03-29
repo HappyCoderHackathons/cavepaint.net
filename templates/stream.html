@@ -216,9 +216,39 @@
     let boardBusy = false;
     let boardDirty = true;
     let lastObjectUrl = null;
+    let liveYawSyncTimer = null;
+    let liveYawPending = null;
+    let lastLiveYawSent = null;
+
+    function angularDistanceDeg(a, b) {
+      return Math.abs(((a - b + 540) % 360) - 180);
+    }
+
+    function scheduleLiveYawSync() {
+      liveYawPending = normalize360(yaw);
+      if (liveYawSyncTimer) return;
+      liveYawSyncTimer = setTimeout(async () => {
+        liveYawSyncTimer = null;
+        const yawToSend = liveYawPending;
+        liveYawPending = null;
+        if (yawToSend == null) return;
+        if (lastLiveYawSent != null && angularDistanceDeg(yawToSend, lastLiveYawSent) < 0.15) return;
+        try {
+          await fetch("/live_view", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ yaw: yawToSend, fov }),
+          });
+          lastLiveYawSent = yawToSend;
+        } catch (_) {
+          // Ignore temporary sync failures; next drag/update retries.
+        }
+      }, 80);
+    }
 
     function syncLabels() {
       yawReadout.textContent = `View ${normalize360(yaw).toFixed(1)}°`;
+      scheduleLiveYawSync();
     }
 
     function markBoardDirty() {

@@ -194,6 +194,22 @@ async def set_color(request):
     return web.Response(status=204)
 
 
+async def set_live_view(request):
+    try:
+        data = await request.json()
+        yaw_raw = data.get("yaw")
+        fov_raw = data.get("fov")
+        if yaw_raw is None and fov_raw is None:
+            raise web.HTTPBadRequest(reason="Expected 'yaw' and/or 'fov' in JSON body")
+        yaw = float(yaw_raw) if yaw_raw is not None else None
+        fov = float(fov_raw) if fov_raw is not None else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise web.HTTPBadRequest(reason="Invalid JSON body for live view")
+
+    tracker.set_live_view(yaw_deg=yaw, fov_deg=fov)
+    return web.Response(status=204)
+
+
 async def mouse_stroke(request):
     try:
         data = await request.json()
@@ -363,6 +379,7 @@ app.router.add_get("/cameras", cameras)
 app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
+app.router.add_post("/live_view", set_live_view)
 app.router.add_post("/stroke", mouse_stroke)
 app.router.add_get("/whiteboard.png", whiteboard)
 app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
