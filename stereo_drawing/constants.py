@@ -1,5 +1,6 @@
 """Shared constants for the stereo drawing system."""
 
+import os
 from pathlib import Path
 
 HAND_MODEL_PATH    = Path(__file__).parent.parent / "hand_landmarker.task"
@@ -12,6 +13,15 @@ SWIPE_META_PATH    = Path(__file__).parent.parent / "swipe_meta.json"
 INDEX_FINGERTIP    = 8
 GESTURE_CONFIDENCE = 0.5
 SWIPE_DISPLAY_FRAMES = 35  # how long a swipe label stays on screen (~1 s)
+
+# When false, disable "3D person" silhouette alpha compositing and
+# behind/in-front splitting. Strokes still project in 3D.
+ENABLE_3D_PERSON = os.getenv("ENABLE_3D_PERSON", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
 
 # 10-color palette (BGR) cycled by swipe left/right when palm is open
 # PALETTE = [

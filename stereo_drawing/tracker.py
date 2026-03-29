@@ -27,6 +27,7 @@ from .constants import (
     GESTURE_META_PATH,
     GESTURE_MODEL_PATH,
     PALETTE,
+    ENABLE_3D_PERSON,
     POSE_MODEL_PATH,
     SWIPE_DISPLAY_FRAMES,
     SWIPE_META_PATH,
@@ -170,14 +171,18 @@ class StereoDrawingTracker:
         if snapshot is not None:
             self._push_state(snapshot)
 
+    def _clear_canvas_unlocked(self):
+        self._strokes.clear()
+        self._erase_batches.clear()
+        self._active_erase_batch_id = None
+        self._active_erase_action_id = None
+        self._was_erasing = False
+        self._was_drawing = False
+        self._canvas_version += 1
+
     def clear_canvas(self):
         with self.lock:
-            self._strokes.clear()
-            self._erase_batches.clear()
-            self._active_erase_batch_id = None
-            self._active_erase_action_id = None
-            self._was_erasing = False
-            self._canvas_version += 1
+            self._clear_canvas_unlocked()
 
     def undo(self):
         with self.lock:
@@ -948,6 +953,9 @@ class StereoDrawingTracker:
         _opposite_swipe_lock_sec = 0.70
         _swipe_block_until = {"swipe_left": 0.0, "swipe_right": 0.0}
         _prev_action = "idle"
+        _was_gun_gesture = False
+        _last_gun_clear_mono = 0.0
+        _gun_clear_cooldown_sec = float(os.getenv("GUN_CLEAR_COOLDOWN_SEC", "1.2"))
         _pose_throttle = max(1, int(os.getenv("POSE_THROTTLE", "3")))
         _pose_frame_idx = 0
         _infer_w = int(os.getenv("INFER_W", "320"))
@@ -998,6 +1006,9 @@ class StereoDrawingTracker:
             if res0.hand_landmarks:
                 hand = res0.hand_landmarks[0]
                 tip0 = draw_hand(frame0, hand, w, h)
+                # `raw_frame` is later used for person-mask compositing. Draw the same
+                # hand dots onto it too so the dots are never hidden.
+                draw_hand(raw_frame, hand, w, h)
                 tip8 = hand[8]
                 tip12 = hand[12]
                 if gesture_clf:
@@ -1071,13 +1082,15 @@ class StereoDrawingTracker:
 
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
-            fresh_mask = get_segmentation_mask(pose_res0) if pose_res0 else None
-            if fresh_mask is not None:
-                if fresh_mask.shape[:2] != (h, w):
-                    fresh_mask = cv2.resize(fresh_mask, (w, h), interpolation=cv2.INTER_LINEAR)
-                    fresh_mask = np.clip(fresh_mask, 0.0, 1.0)
-                _last_person_mask = fresh_mask
-            person_mask = _last_person_mask
+            person_mask = _last_person_mask if ENABLE_3D_PERSON else None
+            if ENABLE_3D_PERSON:
+                fresh_mask = get_segmentation_mask(pose_res0) if pose_res0 else None
+                if fresh_mask is not None:
+                    if fresh_mask.shape[:2] != (h, w):
+                        fresh_mask = cv2.resize(fresh_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+                        fresh_mask = np.clip(fresh_mask, 0.0, 1.0)
+                    _last_person_mask = fresh_mask
+                    person_mask = _last_person_mask
 
             # Triangulate a stable body point (nose, landmark 0) for person_z
             body_pos3d = None
@@ -1145,6 +1158,16 @@ class StereoDrawingTracker:
                     self._submit_and_start_new_session()
                     self._canvas_version += 1
 
+                now_mono = time.monotonic()
+                if gesture_clf and gesture == "gun":
+                    if (
+                        not _was_gun_gesture
+                        and (now_mono - _last_gun_clear_mono) >= _gun_clear_cooldown_sec
+                    ):
+                        self._clear_canvas_unlocked()
+                        _last_gun_clear_mono = now_mono
+                _was_gun_gesture = bool(gesture_clf and gesture == "gun")
+
                 if erasing and tip0 and not self._was_erasing:
                     self._start_erase_action()
                 elif (not erasing or not tip0) and self._was_erasing:
@@ -1211,12 +1234,15 @@ class StereoDrawingTracker:
 
                 # person_z: shoulder midpoint in world coords when pose available,
                 # otherwise triangulated body depth from stereo.
-                if shoulder_world_z is not None:
-                    person_z = shoulder_world_z
+                if ENABLE_3D_PERSON:
+                    if shoulder_world_z is not None:
+                        person_z = shoulder_world_z
+                    else:
+                        if body_pos3d:
+                            _last_person_z = body_pos3d[2]
+                        person_z = _last_person_z
                 else:
-                    if body_pos3d:
-                        _last_person_z = body_pos3d[2]
-                    person_z = _last_person_z
+                    person_z = None
 
                 def alpha_composite(base, overlay, alpha):
                     """Blend overlay onto base using float32 H×W alpha (0=base, 1=overlay)."""
@@ -1231,7 +1257,7 @@ class StereoDrawingTracker:
                     base[s_m] = canvas[s_m]
                     return base
 
-                if person_mask is not None and person_z is not None:
+                if ENABLE_3D_PERSON and person_mask is not None and person_z is not None:
                     # Depth-sorted composite: bg strokes → person (alpha) → fg strokes
                     bg_strokes, fg_strokes = self._strokes.render_layered(
                         frame0.shape,
@@ -1242,7 +1268,7 @@ class StereoDrawingTracker:
                     frame0 = apply_strokes(frame0, bg_strokes)
                     frame0 = alpha_composite(frame0, raw_frame, person_mask)
                     frame0 = apply_strokes(frame0, fg_strokes)
-                elif person_mask is not None:
+                elif ENABLE_3D_PERSON and person_mask is not None:
                     stroke_canvas = self._strokes.render(frame0.shape, project=live_project)
                     frame0 = apply_strokes(frame0, stroke_canvas)
                     frame0 = alpha_composite(frame0, raw_frame, person_mask)

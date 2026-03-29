@@ -85,8 +85,17 @@ def main():
     gestures = meta["gestures"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state_dict = torch.load(GESTURE_MODEL_PATH, map_location=device, weights_only=True)
+    num_classes_ckpt = None
+    for _, v in state_dict.items():
+        if isinstance(v, torch.Tensor) and v.ndim == 2 and v.shape[1] == 32:
+            num_classes_ckpt = int(v.shape[0])
+            break
+    if num_classes_ckpt is not None and num_classes_ckpt != len(gestures):
+        gestures = gestures[:num_classes_ckpt]
+
     model = GestureMLP(num_classes=len(gestures)).to(device)
-    model.load_state_dict(torch.load(GESTURE_MODEL_PATH, map_location=device, weights_only=True))
+    model.load_state_dict(state_dict)
     model.eval()
 
     options = HandLandmarkerOptions(
