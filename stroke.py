@@ -322,14 +322,14 @@ class StrokeStore:
         for s in self._completed:
             if s.pts:
                 avg_z = sum(p[2] for p in s.pts) / len(s.pts)
-                (behind_strokes if avg_z > person_z else infront_strokes).append(s)
+                (infront_strokes if avg_z > person_z else behind_strokes).append(s)
             else:
-                behind_strokes.append(s)
+                infront_strokes.append(s)
 
         active_layer = None
         if self._active and not self._active.empty():
             avg_z = sum(p[2] for p in self._active.pts) / len(self._active.pts)
-            active_layer = "behind" if avg_z > person_z else "infront"
+            active_layer = "infront" if avg_z > person_z else "behind"
 
         behind = np.zeros(shape, dtype=np.uint8)
         for s in behind_strokes:

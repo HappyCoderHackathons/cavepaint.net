@@ -71,6 +71,7 @@ class StereoDrawingTracker:
         self._tracking = {}
         self._sub_lock = threading.Lock()
         self._slots: list[StateSlot] = []
+        self._canvas_version = 0
         self._stone_alpha = 0.60
         self._stone_scroll_per_turn = 3.5
         self._stone_texture = self._load_stone_texture()
@@ -108,6 +109,7 @@ class StereoDrawingTracker:
                 "color_idx": self._color_idx,
                 "swipe_events": list(self._swipe_events),
                 "tracking": dict(self._tracking),
+                "canvas_version": self._canvas_version,
             }
 
     def set_color(self, idx: int):
@@ -117,10 +119,12 @@ class StereoDrawingTracker:
     def clear_canvas(self):
         with self.lock:
             self._strokes.clear()
+            self._canvas_version += 1
 
     def undo(self):
         with self.lock:
             self._strokes.undo()
+            self._canvas_version += 1
 
     def subscribe(self, loop: asyncio.AbstractEventLoop) -> StateSlot:
         slot = StateSlot(loop)
@@ -767,32 +771,9 @@ class StereoDrawingTracker:
                     # Depth-sorted composite: bg strokes → person (alpha) → fg strokes
                     bg_strokes, fg_strokes = self._strokes.render_layered(frame0.shape, person_z)
 
-                    # Debug: tint bg strokes red, fg strokes blue
-                    bg_debug = bg_strokes.copy()
-                    fg_debug = fg_strokes.copy()
-                    bg_m = bg_strokes.any(axis=2)
-                    fg_m = fg_strokes.any(axis=2)
-                    bg_debug[bg_m] = np.clip(bg_strokes[bg_m].astype(np.int16) + [0, 0, 80], 0, 255).astype(np.uint8)
-                    fg_debug[fg_m] = np.clip(fg_strokes[fg_m].astype(np.int16) + [80, 0, 0], 0, 255).astype(np.uint8)
-
-                    # Debug: draw person mask boundary in bright green
-                    mask_u8 = (person_mask * 255).astype(np.uint8)
-                    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    cv2.drawContours(frame0, contours, -1, (0, 255, 0), 3)
-
-                    # Debug labels
-                    n_bg = bg_m.any()
-                    n_fg = fg_m.any()
-                    cv2.putText(frame0, f"BEHIND (red): {sum(1 for s in self._strokes._completed if s.pts and sum(p[2] for p in s.pts)/len(s.pts) > person_z)}",
-                                (10, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    cv2.putText(frame0, f"INFRONT (blue): {sum(1 for s in self._strokes._completed if s.pts and sum(p[2] for p in s.pts)/len(s.pts) <= person_z)}",
-                                (10, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                    cv2.putText(frame0, f"person_z={person_z:.3f}  hand_z={round(hand_world_z,3) if hand_world_z is not None else '--'}",
-                                (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-                    frame0 = apply_strokes(frame0, bg_debug)
+                    frame0 = apply_strokes(frame0, bg_strokes)
                     frame0 = alpha_composite(frame0, raw_frame, person_mask)
-                    frame0 = apply_strokes(frame0, fg_debug)
+                    frame0 = apply_strokes(frame0, fg_strokes)
                 elif person_mask is not None:
                     stroke_canvas = self._strokes.render(frame0.shape)
                     frame0 = apply_strokes(frame0, stroke_canvas)
