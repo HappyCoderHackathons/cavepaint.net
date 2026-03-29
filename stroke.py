@@ -54,22 +54,14 @@ class Stroke:
     # --- rendering ---------------------------------------------------------
 
     def render(self, canvas: np.ndarray, project=None):
-        """Draw this stroke onto *canvas* in-place.
-
-        project(x, y, z) -> (px, py) | None  — omit for pixel-space strokes.
-        """
         if self.empty():
             return
-
         px = self._project(project)
         if len(px) < 2:
             return
+        smooth_pts = self._catmull_rom(px)
+        self._draw(canvas, smooth_pts, self.max_radius)
 
-        speeds = self._speeds()
-        max_spd = max(speeds) if speeds else 1.0
-
-        smooth_pts, radii = self._catmull_rom(px, speeds, max_spd)
-        self._draw(canvas, smooth_pts, radii)
 
     def _project(self, project):
         if project:
@@ -77,37 +69,35 @@ class Stroke:
             return [p for p in out if p is not None]
         return [(int(x), int(y)) for x, y, _ in self.pts]
 
-    def _speeds(self) -> list:
-        """Speed in coordinate units per second between consecutive points."""
-        speeds = [0.0]
-        for i in range(1, len(self.pts)):
-            x0, y0, z0 = self.pts[i - 1]
-            x1, y1, z1 = self.pts[i]
-            dt = max(self.times[i] - self.times[i - 1], 1e-4)
-            dist = np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
-            speeds.append(dist / dt)
-        return speeds
+    # def _speeds(self) -> list:
+    #     """Speed in coordinate units per second between consecutive points."""
+    #     speeds = [0.0]
+    #     for i in range(1, len(self.pts)):
+    #         x0, y0, z0 = self.pts[i - 1]
+    #         x1, y1, z1 = self.pts[i]
+    #         dt = max(self.times[i] - self.times[i - 1], 1e-4)
+    #         dist = np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
+    #         speeds.append(dist / dt)
+    #     return speeds
 
-    def _radius(self, speed: float, max_spd: float) -> int:
-        norm = min(speed / max(max_spd, 1e-6), 1.0)
-        return max(self.min_radius, int(self.max_radius - norm * (self.max_radius - self.min_radius)))
+    # def _radius(self, speed: float, max_spd: float) -> int:
+    #     norm = min(speed / max(max_spd, 1e-6), 1.0)
+    #     return max(self.min_radius, int(self.max_radius - norm * (self.max_radius - self.min_radius)))
 
-    def _catmull_rom(self, px: list, speeds: list, max_spd: float, steps: int = 10):
-        """Catmull-Rom interpolation through 2D pixel points.
+    # def _radius(self, dist: float) -> int:
+    #     dist = max(0.0, min(1.0, dist))
+    #     return max(self.min_radius, int(self.max_radius - dist * (self.max_radius - self.min_radius)))
 
-        Returns (smooth_pts, radii) with len = (len(px)-1)*steps + 1.
-        """
-        # Phantom endpoints so the spline passes through first and last points
+
+    def _catmull_rom(self, px: list, steps: int = 10):
         pts = [px[0]] + list(px) + [px[-1]]
-        spd = [speeds[0]] + list(speeds) + [speeds[-1]]
 
-        out_pts, out_radii = [], []
+        out_pts = []
         for i in range(1, len(pts) - 2):
             p0 = np.array(pts[i - 1], dtype=float)
             p1 = np.array(pts[i],     dtype=float)
             p2 = np.array(pts[i + 1], dtype=float)
             p3 = np.array(pts[i + 2], dtype=float)
-            s0, s1 = spd[i], spd[i + 1]
             for j in range(steps):
                 t = j / steps
                 q = 0.5 * (
@@ -116,26 +106,23 @@ class Stroke:
                     + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t ** 2
                     + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3
                 )
-                s = s0 + (s1 - s0) * t
                 out_pts.append(tuple(q.astype(int)))
-                out_radii.append(self._radius(s, max_spd))
 
         out_pts.append(px[-1])
-        out_radii.append(self._radius(speeds[-1], max_spd))
-        return out_pts, out_radii
+        return out_pts
 
-    def _draw(self, canvas: np.ndarray, pts: list, radii: list):
+    def _draw(self, canvas: np.ndarray, pts: list, radii: int):
         n = len(pts)
         taper = min(10, n // 4)
 
         for i in range(n - 1):
-            r = radii[i]
-            # taper at stroke start and end
+            r = radii
             if taper > 0:
                 if i < taper:
                     r = max(self.min_radius, r * (i + 1) // taper)
                 elif i >= n - 1 - taper:
                     r = max(self.min_radius, r * (n - 1 - i) // taper)
+
 
             p1 = np.array(pts[i],     dtype=float)
             p2 = np.array(pts[i + 1], dtype=float)
@@ -155,7 +142,7 @@ class Stroke:
             cv2.circle(canvas, tuple(p1.astype(int)), r, self.color, -1, cv2.LINE_AA)
 
         if pts:
-            cv2.circle(canvas, pts[-1], radii[-1], self.color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pts[-1], radii, self.color, -1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +162,9 @@ class StrokeStore:
         self._cache: np.ndarray | None = None
         self._dirty = False
         self._pixel_edited = False
+        self.min_radius = 5
+        self.max_radius = 60
+        self.current_radius = 10
 
     # --- stroke lifecycle --------------------------------------------------
 
@@ -182,6 +172,10 @@ class StrokeStore:
         """Start a new stroke (ends any active stroke first)."""
         self._commit_active()
         self._active = Stroke(**kwargs)
+    
+    def _radius(self, dist: float) -> int:
+        dist = max(0.0, min(1.0, dist))
+        return max(self.min_radius, int(self.max_radius - dist * (self.max_radius - self.min_radius)))
 
     def add_point(self, x: float, y: float, z: float = 0.0):
         """Append a point to the active stroke, starting one if needed."""

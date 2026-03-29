@@ -1,1 +1,1 @@
-{"gestures": ["open_hand", "point", "fist"], "input_dim": 78, "fingertip_indices": [4, 8, 12, 16, 20]}
+{"gestures": ["open_hand", "point", "fist", "peace"], "input_dim": 78, "fingertip_indices": [4, 8, 12, 16, 20]}
