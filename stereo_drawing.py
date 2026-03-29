@@ -29,7 +29,7 @@ from pymongo.errors import PyMongoError
 import os
 from dotenv import load_dotenv
 
-from stroke import StrokeStore
+from stroke import Stroke, StrokeStore
 from triangulate import depth_inches_to_str, triangulate
 
 HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
@@ -312,6 +312,90 @@ class StereoDrawingTracker:
             if self.output_frame is None:
                 return None
             return self.output_frame.copy()
+
+    @staticmethod
+    def _project_whiteboard_point(
+        x: float,
+        y: float,
+        z: float,
+        yaw_rad: float,
+        fov_rad: float,
+        width: int,
+        height: int,
+    ):
+        # Normalize camera-space points around the original frame center.
+        xw = float(x) - 320.0
+        yw = float(y) - 240.0
+        zw = float(z) * 25.0 + 400.0
+
+        c = float(np.cos(yaw_rad))
+        s = float(np.sin(yaw_rad))
+        xr = c * xw + s * zw
+        zr = -s * xw + c * zw
+        if zr <= 5.0:
+            return None
+
+        half_fov = fov_rad * 0.5
+        horiz_angle = float(np.arctan2(xr, zr))
+        if abs(horiz_angle) > half_fov:
+            return None
+
+        focal = (width * 0.5) / np.tan(max(half_fov, 1e-4))
+        u = (width * 0.5) + (xr * focal / zr)
+        v = (height * 0.5) + (yw * focal / zr)
+        if u < -2 or u > width + 2 or v < -2 or v > height + 2:
+            return None
+        return int(u), int(v)
+
+    def _snapshot_strokes(self):
+        strokes = []
+        for src in self._strokes._completed:
+            dst = Stroke(color=src.color, max_radius=src.max_radius, min_radius=src.min_radius)
+            dst.pts = list(src.pts)
+            dst.times = list(src.times)
+            strokes.append(dst)
+        active = self._strokes._active
+        if active and not active.empty():
+            dst = Stroke(color=active.color, max_radius=active.max_radius, min_radius=active.min_radius)
+            dst.pts = list(active.pts)
+            dst.times = list(active.times)
+            strokes.append(dst)
+        return strokes
+
+    def render_whiteboard(self, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
+        width = int(np.clip(width, 320, 1920))
+        height = int(np.clip(height, 120, 1080))
+        yaw_deg = float(np.clip(yaw_deg, -85.0, 85.0))
+        fov_deg = float(np.clip(fov_deg, 30.0, 150.0))
+        yaw_rad = float(np.deg2rad(yaw_deg))
+        fov_rad = float(np.deg2rad(fov_deg))
+
+        with self.lock:
+            strokes = self._snapshot_strokes()
+
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+        def project(px, py, pz):
+            return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
+
+        for stroke in strokes:
+            stroke.render(canvas, project=project)
+
+        board = np.full((height, width, 3), 255, dtype=np.uint8)
+        mask = canvas.any(axis=2)
+        board[mask] = canvas[mask]
+
+        cv2.putText(
+            board,
+            f"Yaw {yaw_deg:+.1f} deg | FOV {fov_deg:.0f} deg",
+            (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (40, 40, 40),
+            2,
+            cv2.LINE_AA,
+        )
+        return board
 
     def start(self):
         if self.running:
