@@ -35,7 +35,7 @@ from .constants import (
 from .gesture import GestureClassifier
 from .landmarker import (detect, draw_hand, make_landmarker,
                          make_pose_landmarker, detect_pose, get_segmentation_mask)
-from .mongo import WHITEBOARD_DB_REFRESH_MS, drawings_col, erases_col, points_col
+from .mongo import WHITEBOARD_DB_REFRESH_MS, actions_col, drawings_col, erases_col, points_col
 from .state_slot import StateSlot
 
 
@@ -53,6 +53,9 @@ class StereoDrawingTracker:
         self.running = False
         self.thread = None
         self._active_drawing_id = None
+        self._active_draw_action_id = None
+        self._active_erase_action_id = None
+        self._active_erase_batch_id = None
         self._seq = 0
         self._session_id = uuid4().hex
         self._mongo_enabled = drawings_col is not None and points_col is not None
@@ -69,6 +72,8 @@ class StereoDrawingTracker:
         self._color_idx = 0
         self._swipe_events = []
         self._tracking = {}
+        self._was_erasing = False
+        self._erase_batches = []
         self._sub_lock = threading.Lock()
         self._slots: list[StateSlot] = []
         self._canvas_version = 0
@@ -119,11 +124,31 @@ class StereoDrawingTracker:
     def clear_canvas(self):
         with self.lock:
             self._strokes.clear()
+            self._erase_batches.clear()
+            self._active_erase_batch_id = None
+            self._active_erase_action_id = None
+            self._was_erasing = False
             self._canvas_version += 1
 
     def undo(self):
         with self.lock:
-            self._strokes.undo()
+            # If a stroke is currently active, close it so undo always removes
+            # the latest visible stroke.
+            if self._was_drawing:
+                self._strokes.end()
+                self._finish_drawing_doc(status="completed")
+                self._was_drawing = False
+            if self._was_erasing:
+                self._finish_erase_action(status="completed")
+                self._was_erasing = False
+
+            kind, ref_id = self._undo_last_action_doc()
+            if kind == "erase":
+                self._undo_local_erase_batch(ref_id)
+            else:
+                self._strokes.undo()
+            if self._mongo_whiteboard is not None:
+                self._mongo_whiteboard.invalidate()
             self._canvas_version += 1
 
     def subscribe(self, loop: asyncio.AbstractEventLoop) -> StateSlot:
@@ -383,10 +408,32 @@ class StereoDrawingTracker:
         try:
             result = drawings_col.insert_one(doc)
             self._active_drawing_id = result.inserted_id
+            self._active_draw_action_id = None
+            if actions_col is not None:
+                try:
+                    action_doc = {
+                        "sessionId": self._session_id,
+                        "kind": "draw",
+                        "drawingId": self._active_drawing_id,
+                        "createdAt": now,
+                        "updatedAt": now,
+                        "endedAt": None,
+                        "status": "active",
+                    }
+                    action_result = actions_col.insert_one(action_doc)
+                    self._active_draw_action_id = action_result.inserted_id
+                    drawings_col.update_one(
+                        {"_id": self._active_drawing_id},
+                        {"$set": {"actionId": self._active_draw_action_id}},
+                    )
+                except PyMongoError as exc:
+                    print(f"[mongo] draw action insert failed: {exc}")
+                    self._active_draw_action_id = None
             self._seq = 0
         except PyMongoError as exc:
             print(f"[mongo] drawing insert failed: {exc}")
             self._active_drawing_id = None
+            self._active_draw_action_id = None
 
     def _insert_point_doc(self, x, y, z, color="black", brush_radius=None):
         if not self._mongo_enabled or self._active_drawing_id is None:
@@ -407,6 +454,7 @@ class StereoDrawingTracker:
             print(f"[mongo] point insert failed: {exc}")
 
     def _insert_erase_doc(self, x, y, radius, z=0.0):
+        self._record_local_erase_point(x, y, radius)
         if erases_col is None:
             return
         erase_doc = {
@@ -414,6 +462,10 @@ class StereoDrawingTracker:
             "radius": float(radius), "t": self._utcnow(),
             "sessionId": self._session_id,
         }
+        if self._active_erase_batch_id is not None:
+            erase_doc["eraseBatchId"] = self._active_erase_batch_id
+        if self._active_erase_action_id is not None:
+            erase_doc["actionId"] = self._active_erase_action_id
         if self._active_drawing_id is not None:
             erase_doc["drawingId"] = self._active_drawing_id
         try:
@@ -421,20 +473,186 @@ class StereoDrawingTracker:
         except PyMongoError as exc:
             print(f"[mongo] erase insert failed: {exc}")
 
+    def _start_erase_action(self):
+        self._active_erase_batch_id = uuid4().hex
+        self._erase_batches.append({"batchId": self._active_erase_batch_id, "points": []})
+        self._active_erase_action_id = None
+        if actions_col is None:
+            return
+        now = self._utcnow()
+        action_doc = {
+            "sessionId": self._session_id,
+            "kind": "erase",
+            "eraseBatchId": self._active_erase_batch_id,
+            "createdAt": now,
+            "updatedAt": now,
+            "endedAt": None,
+            "status": "active",
+        }
+        try:
+            result = actions_col.insert_one(action_doc)
+            self._active_erase_action_id = result.inserted_id
+        except PyMongoError as exc:
+            print(f"[mongo] erase action insert failed: {exc}")
+            self._active_erase_action_id = None
+
+    def _finish_erase_action(self, status="completed"):
+        now = self._utcnow()
+        if actions_col is not None and self._active_erase_action_id is not None:
+            try:
+                actions_col.update_one(
+                    {"_id": self._active_erase_action_id},
+                    {"$set": {"updatedAt": now, "endedAt": now, "status": status}},
+                )
+            except PyMongoError as exc:
+                print(f"[mongo] erase action finalize failed: {exc}")
+        self._active_erase_action_id = None
+        self._active_erase_batch_id = None
+
+    def _record_local_erase_point(self, x, y, radius):
+        if self._active_erase_batch_id is None:
+            self._active_erase_batch_id = uuid4().hex
+            self._erase_batches.append({"batchId": self._active_erase_batch_id, "points": []})
+        target = None
+        for batch in reversed(self._erase_batches):
+            if batch.get("batchId") == self._active_erase_batch_id:
+                target = batch
+                break
+        if target is None:
+            target = {"batchId": self._active_erase_batch_id, "points": []}
+            self._erase_batches.append(target)
+        target["points"].append((float(x), float(y), float(radius)))
+
+    def _undo_local_erase_batch(self, erase_batch_id=None):
+        if not self._erase_batches:
+            return
+        removed = False
+        if erase_batch_id is None:
+            self._erase_batches.pop()
+            removed = True
+        else:
+            for idx in range(len(self._erase_batches) - 1, -1, -1):
+                if self._erase_batches[idx].get("batchId") == erase_batch_id:
+                    self._erase_batches.pop(idx)
+                    removed = True
+                    break
+        if not removed:
+            return
+        self._reapply_local_erases()
+
+    def _reapply_local_erases(self):
+        shape = self.output_frame.shape if self.output_frame is not None else (self.height, self.width, 3)
+        self._strokes._cache = None
+        self._strokes._dirty = False
+        self._strokes._pixel_edited = False
+        self._strokes.render(shape)
+        for batch in self._erase_batches:
+            for x, y, radius in batch.get("points", []):
+                self._strokes.erase_near(x, y, radius=radius)
+
     def _finish_drawing_doc(self, status="completed"):
         if not self._mongo_enabled or self._active_drawing_id is None:
             return
+        drawing_id = self._active_drawing_id
+        action_id = self._active_draw_action_id
         now = self._utcnow()
         try:
             drawings_col.update_one(
-                {"_id": self._active_drawing_id},
+                {"_id": drawing_id},
                 {"$set": {"updatedAt": now, "endedAt": now, "status": status, "pointCount": self._seq}},
             )
         except PyMongoError as exc:
             print(f"[mongo] drawing finalize failed: {exc}")
-        finally:
-            self._active_drawing_id = None
-            self._seq = 0
+        if actions_col is not None and action_id is not None:
+            try:
+                actions_col.update_one(
+                    {"_id": action_id},
+                    {"$set": {"updatedAt": now, "endedAt": now, "status": status}},
+                )
+            except PyMongoError as exc:
+                print(f"[mongo] draw action finalize failed: {exc}")
+        self._active_drawing_id = None
+        self._active_draw_action_id = None
+        self._seq = 0
+
+    def _undo_drawing_doc_by_id(self, drawing_id):
+        if drawing_id is None or drawings_col is None or points_col is None:
+            return
+        points_col.delete_many({"sessionId": self._session_id, "drawingId": drawing_id})
+        if erases_col is not None:
+            erases_col.delete_many({"sessionId": self._session_id, "drawingId": drawing_id})
+        now = self._utcnow()
+        drawings_col.update_one(
+            {"_id": drawing_id},
+            {"$set": {"updatedAt": now, "endedAt": now, "status": "undone", "pointCount": 0}},
+        )
+
+    def _undo_last_drawing_doc(self):
+        if drawings_col is None or points_col is None:
+            return
+        try:
+            latest = drawings_col.find_one(
+                {"sessionId": self._session_id, "status": {"$in": ["active", "completed"]}},
+                projection={"_id": 1},
+                sort=[("_id", -1)],
+            )
+            if latest is None:
+                return
+
+            drawing_id = latest.get("_id")
+            if drawing_id is None:
+                return
+
+            self._undo_drawing_doc_by_id(drawing_id)
+        except PyMongoError as exc:
+            print(f"[mongo] undo failed: {exc}")
+
+    def _undo_last_action_doc(self):
+        if actions_col is None:
+            self._undo_last_drawing_doc()
+            return "draw", None
+        try:
+            latest = actions_col.find_one(
+                {"sessionId": self._session_id, "status": {"$in": ["active", "completed"]}},
+                sort=[("_id", -1)],
+            )
+            if latest is None:
+                self._undo_last_drawing_doc()
+                return "draw", None
+
+            now = self._utcnow()
+            action_id = latest.get("_id")
+            kind = str(latest.get("kind", "draw"))
+
+            if kind == "erase":
+                erase_batch_id = latest.get("eraseBatchId")
+                if erases_col is not None and erase_batch_id is not None:
+                    erases_col.delete_many(
+                        {"sessionId": self._session_id, "eraseBatchId": erase_batch_id}
+                    )
+                actions_col.update_one(
+                    {"_id": action_id},
+                    {"$set": {"updatedAt": now, "endedAt": now, "status": "undone"}},
+                )
+                return "erase", erase_batch_id
+
+            drawing_id = latest.get("drawingId")
+            if drawing_id is None and drawings_col is not None and action_id is not None:
+                linked = drawings_col.find_one(
+                    {"sessionId": self._session_id, "actionId": action_id},
+                    projection={"_id": 1},
+                )
+                drawing_id = linked.get("_id") if linked else None
+            self._undo_drawing_doc_by_id(drawing_id)
+            actions_col.update_one(
+                {"_id": action_id},
+                {"$set": {"updatedAt": now, "endedAt": now, "status": "undone"}},
+            )
+            return "draw", drawing_id
+        except PyMongoError as exc:
+            print(f"[mongo] action undo failed: {exc}")
+            self._undo_last_drawing_doc()
+            return "draw", None
 
     # ------------------------------------------------------------------
     # Main processing loop
@@ -483,6 +701,9 @@ class StereoDrawingTracker:
                 self._strokes.end()
                 self._finish_drawing_doc(status="interrupted")
                 self._was_drawing = False
+            if self._was_erasing:
+                self._finish_erase_action(status="interrupted")
+                self._was_erasing = False
             if reader0 is not None:
                 reader0.stop()
             if not single_cam and reader1 is not None:
@@ -691,6 +912,12 @@ class StereoDrawingTracker:
             z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
+                if erasing and tip0 and not self._was_erasing:
+                    self._start_erase_action()
+                elif (not erasing or not tip0) and self._was_erasing:
+                    self._finish_erase_action(status="completed")
+                    self._was_erasing = False
+
                 if erasing and tip0:
                     if self._was_drawing:
                         self._strokes.end()
@@ -699,6 +926,7 @@ class StereoDrawingTracker:
                     self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
                     self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
                     self._was_drawing = False
+                    self._was_erasing = True
                     self._canvas_version += 1
                 elif drawing and tip0:
                     if not self._was_drawing:

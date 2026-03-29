@@ -26,6 +26,7 @@ WHITEBOARD_DB_REFRESH_MS = _env_int("WHITEBOARD_DB_REFRESH_MS", 250)
 drawings_col = None
 points_col   = None
 erases_col   = None
+actions_col  = None
 
 if _uri:
     try:
@@ -34,12 +35,16 @@ if _uri:
         drawings_col = _db["drawings"]
         points_col   = _db["points"]
         erases_col   = _db["erases"]
+        actions_col  = _db["actions"]
         _client.admin.command("ping")
         drawings_col.create_index([("sessionId", 1), ("createdAt", 1)])
         points_col.create_index([("sessionId", 1), ("_id", 1)])
         erases_col.create_index([("sessionId", 1), ("_id", 1)])
+        erases_col.create_index([("sessionId", 1), ("eraseBatchId", 1)])
+        actions_col.create_index([("sessionId", 1), ("_id", 1)])
     except Exception as exc:
         print(f"[mongo] Disabled (connection failed): {exc}")
         drawings_col = None
         points_col   = None
         erases_col   = None
+        actions_col  = None
