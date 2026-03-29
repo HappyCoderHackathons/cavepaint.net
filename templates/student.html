@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cavepaint — Tribe Whiteboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            cave0: "#160f0a",
+            cave1: "#2a1d13",
+            clay: "#9e6b3d",
+            chalk: "#f1e4cf",
+            ember: "#e56a2e",
+          },
+          fontFamily: {
+            display: ["Cinzel", "serif"],
+            body: ["Manrope", "ui-sans-serif", "system-ui"],
+          },
+          boxShadow: {
+            cave: "0 18px 60px rgba(0,0,0,0.45)",
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    /* Subtle scanline texture over the board surface */
+    #boardSurface::after {
+      content: "";
+      pointer-events: none;
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        180deg,
+        transparent 0px,
+        transparent 3px,
+        rgba(0,0,0,0.018) 3px,
+        rgba(0,0,0,0.018) 4px
+      );
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-cave0 font-body text-chalk overflow-hidden">
+
+  <!-- Ambient light gradients -->
+  <div class="pointer-events-none fixed inset-0 opacity-25" style="background:radial-gradient(circle at 12% 18%, rgba(229,106,46,0.38), transparent 38%),radial-gradient(circle at 84% 12%, rgba(158,107,61,0.26), transparent 40%),radial-gradient(circle at 50% 100%, rgba(255,236,204,0.09), transparent 35%);"></div>
+
+  <!-- Cave wall texture -->
+  <img
+    src="/static/images/cave_wall.jpg"
+    alt=""
+    class="pointer-events-none fixed inset-0 z-0 h-full w-full object-cover opacity-[0.18]"
+    draggable="false"
+  >
+
+  <main class="relative z-10 flex flex-col min-h-screen w-full px-5 py-5 gap-4 sm:px-8 sm:py-6">
+
+    <!-- Header -->
+    <header class="flex items-center justify-between shrink-0">
+      <div class="flex items-center gap-4">
+        <img
+          src="/static/images/cave_man_2.png"
+          alt="Caveman"
+          class="h-14 w-14 object-contain drop-shadow-[0_6px_18px_rgba(0,0,0,0.6)] sm:h-20 sm:w-20"
+          draggable="false"
+        >
+        <div>
+          <h1 class="font-display text-2xl leading-tight text-orange-100 drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)] sm:text-4xl">
+            Tribe Whiteboard
+          </h1>
+          <p class="text-xs text-orange-100/60 tracking-widest uppercase sm:text-sm">Cavepaint.net — student view</p>
+        </div>
+      </div>
+
+      <!-- Live indicator -->
+      <div class="flex items-center gap-2 rounded-full border border-ember/30 bg-cave1/70 px-3 py-1.5 backdrop-blur-sm">
+        <span id="liveDot" class="h-2 w-2 rounded-full bg-ember animate-pulse"></span>
+        <span class="text-xs font-semibold uppercase tracking-widest text-ember">Live</span>
+      </div>
+    </header>
+
+    <!-- Whiteboard — fills remaining vertical space -->
+    <section class="flex flex-col flex-1 min-h-0 gap-2">
+
+      <!-- Board surface -->
+      <div
+        id="boardSurface"
+        class="relative flex-1 min-h-0 w-full select-none overflow-hidden shadow-cave rounded-sm cursor-grab active:cursor-grabbing"
+        style="background:#f5ede0;"
+      >
+        <img
+          id="whiteboardImg"
+          alt="Whiteboard drawing"
+          class="h-full w-full object-fill"
+          draggable="false"
+        >
+        <!-- Top vignette -->
+        <div class="pointer-events-none absolute inset-x-0 top-0 h-8 bg-gradient-to-b from-black/10 to-transparent"></div>
+        <!-- Bottom vignette -->
+        <div class="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-black/10 to-transparent"></div>
+        <!-- Cave frame overlay -->
+        <div class="pointer-events-none absolute inset-y-0 left-1/2 z-10 w-full -translate-x-1/2">
+          <img
+            src="/static/images/cave.png"
+            alt=""
+            class="absolute left-1/2 top-1/2 h-[140%] w-[200%] -translate-x-1/2 -translate-y-1/2 object-fill opacity-30"
+            style="filter: brightness(0.45) saturate(0.7);
+                   -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 18%, black 82%, transparent 100%);
+                   mask-image: linear-gradient(to bottom, transparent 0%, black 18%, black 82%, transparent 100%);"
+            draggable="false"
+          >
+        </div>
+      </div>
+
+      <!-- Controls row -->
+      <div class="flex flex-wrap items-center justify-between gap-3 shrink-0 px-1">
+        <p class="text-[11px] text-orange-100/50 uppercase tracking-widest">
+          Drag to rotate · Scroll to zoom
+        </p>
+        <div class="flex items-center gap-3">
+          <span class="text-[11px] uppercase tracking-[0.14em] text-orange-100/60">FOV</span>
+          <input
+            id="fovRange"
+            type="range" min="30" max="150" step="1" value="80"
+            class="w-32 accent-ember"
+          >
+          <span id="fovValue" class="w-8 text-xs font-semibold text-amber-200 tabular-nums">80°</span>
+          <span id="yawReadout" class="w-16 text-xs font-semibold text-amber-200 tabular-nums text-right">0.0°</span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    const whiteboardImg  = document.getElementById("whiteboardImg");
+    const boardSurface   = document.getElementById("boardSurface");
+    const fovRange       = document.getElementById("fovRange");
+    const fovValue       = document.getElementById("fovValue");
+    const yawReadout     = document.getElementById("yawReadout");
+    const liveDot        = document.getElementById("liveDot");
+
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const wrap360 = (v) => { const w = v % 360; return w < 0 ? w + 360 : w; };
+
+    let yaw = 0.0;
+    let fov = 80.0;
+    let dragging = false;
+    let dragStartX = 0;
+    let dragStartYaw = 0;
+    let boardBusy = false;
+    let boardDirty = true;
+    let lastObjectUrl = null;
+
+    function syncLabels() {
+      fovRange.value = Math.round(fov).toString();
+      fovValue.textContent = Math.round(fov) + "°";
+      yawReadout.textContent = wrap360(yaw).toFixed(1) + "°";
+    }
+
+    async function refreshWhiteboard() {
+      if (boardBusy) { boardDirty = true; return; }
+      if (!boardDirty) return;
+      boardBusy = true;
+      boardDirty = false;
+      try {
+        const rect   = boardSurface.getBoundingClientRect();
+        const width  = Math.max(320, Math.round(rect.width));
+        const height = Math.max(120, Math.round(rect.height));
+        const url    = `/whiteboard.png?yaw=${wrap360(yaw).toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
+        const resp   = await fetch(url, { cache: "no-store" });
+        if (!resp.ok) return;
+        const blob   = await resp.blob();
+        const objUrl = URL.createObjectURL(blob);
+        whiteboardImg.src = objUrl;
+        if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+        lastObjectUrl = objUrl;
+        liveDot.style.opacity = "1";
+      } catch (_) {
+        liveDot.style.opacity = "0.3";
+      } finally {
+        boardBusy = false;
+        if (boardDirty) refreshWhiteboard();
+      }
+    }
+
+    // Drag to rotate yaw
+    boardSurface.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      dragStartX = e.clientX;
+      dragStartYaw = yaw;
+      boardSurface.setPointerCapture(e.pointerId);
+    });
+    boardSurface.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      yaw = wrap360(dragStartYaw + (e.clientX - dragStartX) * 0.22);
+      syncLabels();
+      boardDirty = true;
+    });
+    function stopDrag(e) {
+      if (dragging) {
+        dragging = false;
+        if (typeof e.pointerId === "number") boardSurface.releasePointerCapture(e.pointerId);
+      }
+    }
+    boardSurface.addEventListener("pointerup", stopDrag);
+    boardSurface.addEventListener("pointercancel", stopDrag);
+    boardSurface.addEventListener("lostpointercapture", () => { dragging = false; });
+
+    // Scroll to zoom FOV
+    boardSurface.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      fov = clamp(fov + e.deltaY * 0.05, 30, 150);
+      syncLabels();
+      boardDirty = true;
+    }, { passive: false });
+
+    // FOV slider
+    fovRange.addEventListener("input", () => {
+      fov = clamp(Number(fovRange.value) || 80, 30, 150);
+      syncLabels();
+      boardDirty = true;
+    });
+
+    window.addEventListener("resize", () => { boardDirty = true; });
+
+    // Poll whiteboard every 100 ms
+    setInterval(() => {
+      if (document.hidden) return;
+      boardDirty = true;
+      refreshWhiteboard();
+    }, 100);
+
+    syncLabels();
+    refreshWhiteboard();
+  </script>
+</body>
+</html>

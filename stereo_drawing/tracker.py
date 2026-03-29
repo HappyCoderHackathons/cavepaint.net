@@ -5,6 +5,7 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -25,13 +26,15 @@ from .constants import (
     GESTURE_META_PATH,
     GESTURE_MODEL_PATH,
     PALETTE,
+    POSE_MODEL_PATH,
     SWIPE_DISPLAY_FRAMES,
     SWIPE_META_PATH,
     SWIPE_MODEL_PATH,
     _PALM_INDICES,
 )
 from .gesture import GestureClassifier
-from .landmarker import detect, draw_hand, make_landmarker
+from .landmarker import (detect, draw_hand, make_landmarker,
+                         make_pose_landmarker, detect_pose, get_segmentation_mask)
 from .mongo import WHITEBOARD_DB_REFRESH_MS, drawings_col, erases_col, points_col
 from .state_slot import StateSlot
 
@@ -458,12 +461,19 @@ class StereoDrawingTracker:
             swipe_det, swipe_events = self._load_swipe_detector()
 
             try:
-                with make_landmarker() as lm0, make_landmarker() as lm1:
-                    with ThreadPoolExecutor(max_workers=2) as pool:
+                with ExitStack() as stack:
+                    lm0 = stack.enter_context(make_landmarker())
+                    lm1 = stack.enter_context(make_landmarker())
+                    has_pose = POSE_MODEL_PATH.exists()
+                    pose_lm0 = stack.enter_context(make_pose_landmarker()) if has_pose else None
+                    pose_lm1 = (stack.enter_context(make_pose_landmarker())
+                                if has_pose and not single_cam else None)
+                    with ThreadPoolExecutor(max_workers=4) as pool:
                         self._run_loop(
                             lm0, lm1, pool,
                             reader0, reader1, single_cam,
                             gesture_clf, swipe_det, swipe_events,
+                            pose_lm0=pose_lm0, pose_lm1=pose_lm1,
                         )
             except Exception as exc:
                 with self.lock:
@@ -521,13 +531,15 @@ class StereoDrawingTracker:
                 pass
         return None, []
 
-    def _run_loop(self, lm0, lm1, pool, reader0, reader1, single_cam, gesture_clf, swipe_det, swipe_events):
+    def _run_loop(self, lm0, lm1, pool, reader0, reader1, single_cam, gesture_clf, swipe_det, swipe_events, pose_lm0=None, pose_lm1=None):
         _fps = 0.0
         _fps_count = 0
         _fps_t0 = time.monotonic()
         _smooth_pinch = 0.5
         _resize_cooldown = 0
         _small_radius_lock_until = 0.0
+        _last_person_z = None
+        _last_person_mask = None
         _small_radius_lock_px = 16
         _small_radius_lock_sec = 0.8
         _prev_action = "idle"
@@ -541,6 +553,7 @@ class StereoDrawingTracker:
 
             frame0 = cv2.flip(frame0, 1)
             frame1 = cv2.flip(frame1, 1)
+            raw_frame = frame0.copy()
 
             if frame0.shape != frame1.shape:
                 frame1 = cv2.resize(frame1, (frame0.shape[1], frame0.shape[0]))
@@ -551,10 +564,16 @@ class StereoDrawingTracker:
             if single_cam:
                 res0 = detect(lm0, frame0, ts)
                 res1 = res0
+                pose_res0 = detect_pose(pose_lm0, frame0, ts) if pose_lm0 else None
+                pose_res1 = None
             else:
-                f0 = pool.submit(detect, lm0, frame0, ts)
-                f1 = pool.submit(detect, lm1, frame1, ts)
-                res0, res1 = f0.result(), f1.result()
+                fh0 = pool.submit(detect, lm0, frame0, ts)
+                fh1 = pool.submit(detect, lm1, frame1, ts)
+                fp0 = pool.submit(detect_pose, pose_lm0, frame0, ts) if pose_lm0 else None
+                fp1 = pool.submit(detect_pose, pose_lm1, frame1, ts) if pose_lm1 else None
+                res0, res1 = fh0.result(), fh1.result()
+                pose_res0 = fp0.result() if fp0 else None
+                pose_res1 = fp1.result() if fp1 else None
 
             tip0 = tip1 = tip8 = tip12 = None
             gesture = None
@@ -617,6 +636,20 @@ class StereoDrawingTracker:
 
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
+            fresh_mask = get_segmentation_mask(pose_res0) if pose_res0 else None
+            if fresh_mask is not None and fresh_mask.shape[:2] == frame0.shape[:2]:
+                _last_person_mask = fresh_mask
+            person_mask = _last_person_mask
+
+            # Triangulate a stable body point (nose, landmark 0) for person_z
+            body_pos3d = None
+            if pose_res0 and pose_res0.pose_landmarks and pose_res1 and pose_res1.pose_landmarks:
+                nose0 = pose_res0.pose_landmarks[0][0]
+                nose1 = pose_res1.pose_landmarks[0][0]
+                nose_px0 = (nose0.x * w, nose0.y * h)
+                nose_px1 = (nose1.x * w, nose1.y * h)
+                body_pos3d = triangulate(nose_px0, nose_px1)
+
             # Frame labels
             label0 = f"CAM {self.cam0}" + (" (left)" if not single_cam else "")
             label1 = f"CAM {self.cam1 if not single_cam else self.cam0}" + (" (right)" if not single_cam else "")
@@ -645,7 +678,17 @@ class StereoDrawingTracker:
                 cv2.putText(frame0, depth_str, (20, frame0.shape[0] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, depth_color, 2, cv2.LINE_AA)
 
-            z = pos3d[2] if pos3d else 0.0
+            # Stroke Z relative to shoulder midpoint (in meters).
+            # Negative = hand in front of shoulders = stroke in front of person.
+            # Positive = hand behind shoulders = stroke behind person.
+            # Falls back to stereo depth if pose unavailable.
+            hand_world_z = None
+            shoulder_world_z = None
+            if pose_res0 and pose_res0.pose_world_landmarks:
+                wl = pose_res0.pose_world_landmarks[0]
+                shoulder_world_z = (wl[11].z + wl[12].z) / 2
+                hand_world_z = min(wl[15].z, wl[16].z)  # forward-most wrist
+            z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
                 if erasing and tip0:
@@ -698,9 +741,65 @@ class StereoDrawingTracker:
                         self._finish_drawing_doc(status="completed")
                     self._was_drawing = False
 
-                stroke_canvas = self._strokes.render(frame0.shape)
-                mask = stroke_canvas.any(axis=2)
-                frame0[mask] = stroke_canvas[mask]
+                # person_z: shoulder midpoint in world coords when pose available,
+                # otherwise triangulated body depth from stereo.
+                if shoulder_world_z is not None:
+                    person_z = shoulder_world_z
+                else:
+                    if body_pos3d:
+                        _last_person_z = body_pos3d[2]
+                    person_z = _last_person_z
+
+                def alpha_composite(base, overlay, alpha):
+                    """Blend overlay onto base using float32 H×W alpha (0=base, 1=overlay)."""
+                    a = alpha[:, :, np.newaxis]
+                    return np.clip(
+                        overlay.astype(np.float32) * a + base.astype(np.float32) * (1.0 - a),
+                        0, 255,
+                    ).astype(np.uint8)
+
+                def apply_strokes(base, canvas):
+                    s_m = canvas.any(axis=2)
+                    base[s_m] = canvas[s_m]
+                    return base
+
+                if person_mask is not None and person_z is not None:
+                    # Depth-sorted composite: bg strokes → person (alpha) → fg strokes
+                    bg_strokes, fg_strokes = self._strokes.render_layered(frame0.shape, person_z)
+
+                    # Debug: tint bg strokes red, fg strokes blue
+                    bg_debug = bg_strokes.copy()
+                    fg_debug = fg_strokes.copy()
+                    bg_m = bg_strokes.any(axis=2)
+                    fg_m = fg_strokes.any(axis=2)
+                    bg_debug[bg_m] = np.clip(bg_strokes[bg_m].astype(np.int16) + [0, 0, 80], 0, 255).astype(np.uint8)
+                    fg_debug[fg_m] = np.clip(fg_strokes[fg_m].astype(np.int16) + [80, 0, 0], 0, 255).astype(np.uint8)
+
+                    # Debug: draw person mask boundary in bright green
+                    mask_u8 = (person_mask * 255).astype(np.uint8)
+                    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(frame0, contours, -1, (0, 255, 0), 3)
+
+                    # Debug labels
+                    n_bg = bg_m.any()
+                    n_fg = fg_m.any()
+                    cv2.putText(frame0, f"BEHIND (red): {sum(1 for s in self._strokes._completed if s.pts and sum(p[2] for p in s.pts)/len(s.pts) > person_z)}",
+                                (10, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(frame0, f"INFRONT (blue): {sum(1 for s in self._strokes._completed if s.pts and sum(p[2] for p in s.pts)/len(s.pts) <= person_z)}",
+                                (10, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                    cv2.putText(frame0, f"person_z={person_z:.3f}  hand_z={round(hand_world_z,3) if hand_world_z is not None else '--'}",
+                                (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                    frame0 = apply_strokes(frame0, bg_debug)
+                    frame0 = alpha_composite(frame0, raw_frame, person_mask)
+                    frame0 = apply_strokes(frame0, fg_debug)
+                elif person_mask is not None:
+                    stroke_canvas = self._strokes.render(frame0.shape)
+                    frame0 = apply_strokes(frame0, stroke_canvas)
+                    frame0 = alpha_composite(frame0, raw_frame, person_mask)
+                else:
+                    stroke_canvas = self._strokes.render(frame0.shape)
+                    frame0 = apply_strokes(frame0, stroke_canvas)
 
                 if erasing and tip0:
                     cv2.circle(frame0, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)

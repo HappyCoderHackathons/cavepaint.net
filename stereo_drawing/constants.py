@@ -3,6 +3,7 @@
 from pathlib import Path
 
 HAND_MODEL_PATH    = Path(__file__).parent.parent / "hand_landmarker.task"
+POSE_MODEL_PATH    = Path(__file__).parent.parent / "pose_landmarker.task"
 GESTURE_MODEL_PATH = Path(__file__).parent.parent / "gesture_model.pth"
 GESTURE_META_PATH  = Path(__file__).parent.parent / "gesture_meta.json"
 SWIPE_MODEL_PATH   = Path(__file__).parent.parent / "swipe_model.pth"

@@ -215,6 +215,7 @@ class StrokeStore:
         self._completed: list[Stroke] = []
         self._active: Stroke | None = None
         self._cache: np.ndarray | None = None
+        self._erase_canvas: np.ndarray | None = None
         self._dirty = False
         self._pixel_edited = False
         self.min_radius = 5
@@ -290,20 +291,65 @@ class StrokeStore:
     #         self._dirty = True
 
     def erase_near(self, x: float, y: float, radius: float = 40.0):
-        if self._cache is None:
-            return
-        cv2.circle(self._cache, (int(x), int(y)), int(radius), (0, 0, 0), -1, cv2.LINE_AA)
-        self._pixel_edited = True # Has been erased over
+        pt = (int(x), int(y))
+        r  = int(radius)
+        if self._cache is not None:
+            cv2.circle(self._cache, pt, r, (0, 0, 0), -1, cv2.LINE_AA)
+            self._pixel_edited = True
+            # Lazily init erase canvas (all-white = nothing erased) on first use
+            if self._erase_canvas is None:
+                self._erase_canvas = np.full(self._cache.shape, 255, dtype=np.uint8)
+            cv2.circle(self._erase_canvas, pt, r, (0, 0, 0), -1, cv2.LINE_AA)
 
 
     def clear(self):
         self._completed.clear()
         self._active = None
         self._cache = None
+        self._erase_canvas = None
         self._dirty = False
         self._pixel_edited = False
 
     # --- rendering ---------------------------------------------------------
+
+    def render_layered(self, shape: tuple, person_z: float, project=None):
+        """Return (behind_canvas, infront_canvas) splitting strokes by Z vs person_z.
+
+        Strokes whose mean Z > person_z are "behind" the person (drawn first);
+        strokes whose mean Z <= person_z are "in front" (drawn after).
+        """
+        behind_strokes, infront_strokes = [], []
+        for s in self._completed:
+            if s.pts:
+                avg_z = sum(p[2] for p in s.pts) / len(s.pts)
+                (behind_strokes if avg_z > person_z else infront_strokes).append(s)
+            else:
+                behind_strokes.append(s)
+
+        active_layer = None
+        if self._active and not self._active.empty():
+            avg_z = sum(p[2] for p in self._active.pts) / len(self._active.pts)
+            active_layer = "behind" if avg_z > person_z else "infront"
+
+        behind = np.zeros(shape, dtype=np.uint8)
+        for s in behind_strokes:
+            s.render(behind, project)
+        if active_layer == "behind":
+            self._active.render(behind, project)
+
+        infront = np.zeros(shape, dtype=np.uint8)
+        for s in infront_strokes:
+            s.render(infront, project)
+        if active_layer == "infront":
+            self._active.render(infront, project)
+
+        # Apply accumulated erase marks to both layers
+        if self._erase_canvas is not None and self._erase_canvas.shape == shape:
+            erased = ~self._erase_canvas.any(axis=2)  # True where black circles were drawn
+            behind[erased]  = 0
+            infront[erased] = 0
+
+        return behind, infront
 
     def render(self, shape: tuple, project=None) -> np.ndarray:
         """Return a canvas (same shape) with all strokes drawn.

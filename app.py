@@ -63,12 +63,17 @@ tracker.start()
 pcs: set[RTCPeerConnection] = set()
 
 TEMPLATE = (Path(__file__).parent / "templates" / "stream.html").read_text()
+STUDENT_TEMPLATE = (Path(__file__).parent / "templates" / "student.html").read_text()
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def index(request):
     return web.Response(content_type="text/html", text=TEMPLATE)
+
+
+async def student(request):
+    return web.Response(content_type="text/html", text=STUDENT_TEMPLATE)
 
 
 async def offer(request):
@@ -212,6 +217,7 @@ async def on_shutdown(app):
 app = web.Application()
 app.on_shutdown.append(on_shutdown)
 app.router.add_get("/", index)
+app.router.add_get("/student", student)
 app.router.add_post("/offer", offer)
 app.router.add_post("/clear", clear)
 app.router.add_post("/undo", undo)
