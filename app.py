@@ -112,6 +112,40 @@ async def state(request):
     )
 
 
+async def stream_state(request):
+    loop = asyncio.get_event_loop()
+    slot = tracker.subscribe(loop)
+    response = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await response.prepare(request)
+    try:
+        while True:
+            try:
+                snapshot = await asyncio.wait_for(slot.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                await response.write(b": keepalive\n\n")
+                continue
+            events = [
+                {"label": lbl, "color_idx": ci, "frames": f}
+                for lbl, ci, f in snapshot["swipe_events"]
+            ]
+            data = json.dumps({
+                "color_idx": snapshot["color_idx"],
+                "palette": PALETTE_HEX,
+                "swipe_events": events,
+                "tracking": snapshot["tracking"],
+            })
+            await response.write(f"data: {data}\n\n".encode())
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        tracker.unsubscribe(slot)
+    return response
+
+
 async def set_color(request):
     try:
         data = await request.json()
@@ -161,6 +195,7 @@ app.router.add_post("/clear", clear)
 app.router.add_post("/undo", undo)
 app.router.add_get("/cameras", cameras)
 app.router.add_get("/state", state)
+app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_get("/whiteboard.png", whiteboard)
 
