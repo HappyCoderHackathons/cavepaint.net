@@ -55,7 +55,8 @@ PALETTE = [
     (130,   0, 180),  # purple
     ( 19,  69, 139),  # brown
 ]
-_PALM_INDICES = [0, 5, 9, 13, 17]
+_PALM_INDICES       = [0, 5, 9, 13, 17]
+SWIPE_DISPLAY_FRAMES = 35   # how long a swipe label stays on screen (~1 s)
 
 # ---------------------------------------------------------------------------
 # Gesture classifier (mirrors preview.py)
@@ -385,7 +386,8 @@ class StereoDrawingTracker:
                 pass  # no model — draw always
 
         # Load swipe detector if model exists
-        swipe_det = None
+        swipe_det    = None
+        swipe_events = []   # list of (label, new_color_idx, frames_remaining) — thread-local
         if SWIPE_MODEL_PATH.exists() and SWIPE_META_PATH.exists():
             try:
                 swipe_det = SwipeDetector(SWIPE_MODEL_PATH, SWIPE_META_PATH)
@@ -450,6 +452,9 @@ class StereoDrawingTracker:
                                     self._color_idx = (self._color_idx + 1) % len(PALETTE)
                                 elif label == "swipe_left":
                                     self._color_idx = (self._color_idx - 1) % len(PALETTE)
+                                if label in ("swipe_left", "swipe_right"):
+                                    swipe_events.append((label, self._color_idx,
+                                                         SWIPE_DISPLAY_FRAMES))
 
                         pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
@@ -507,8 +512,12 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
 
+                            self._draw_swipe_events(combined, swipe_events, PALETTE)
                             self._draw_palette(combined, PALETTE, self._color_idx)
                             self.output_frame = combined
+
+                        swipe_events = [(lbl, ci, f - 1)
+                                        for lbl, ci, f in swipe_events if f > 1]
 
         except Exception as exc:
             with self.lock:
@@ -524,6 +533,27 @@ class StereoDrawingTracker:
             cap0.release()
             if cap1 is not None:
                 cap1.release()
+
+    @staticmethod
+    def _draw_swipe_events(frame, events, palette):
+        """Overlay recent swipe labels, fading out as frames_remaining drops."""
+        if not events:
+            return
+        h, w = frame.shape[:2]
+        y = h // 2 - 60
+        for label, color_idx, frames_left in events:
+            text   = label.upper().replace('_', ' ')
+            color  = palette[color_idx]
+            # Dim the label proportionally as it expires
+            alpha  = min(frames_left / 15.0, 1.0)
+            tcolor = tuple(int(c * alpha) for c in color)
+            font   = cv2.FONT_HERSHEY_SIMPLEX
+            scale  = 1.2
+            thick  = 3
+            sz     = cv2.getTextSize(text, font, scale, thick)[0]
+            x      = (w - sz[0]) // 2
+            cv2.putText(frame, text, (x, y), font, scale, tcolor, thick, cv2.LINE_AA)
+            y     += sz[1] + 12
 
     @staticmethod
     def _draw_palette(frame, palette, active_idx):

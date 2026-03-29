@@ -23,6 +23,15 @@ PALM_INDICES = [0, 5, 9, 13, 17]
 CONFIDENCE_THRESHOLD = 0.7
 COOLDOWN_FRAMES      = 20
 DISPLAY_FRAMES       = 30
+OPPOSITE_LOCKOUT     = 45   # frames (~1.5 s) to suppress the reverse direction after a swipe
+
+# Maps each swipe to the direction whose return motion would look like the opposite
+OPPOSITES = {
+    "swipe_left":  "swipe_right",
+    "swipe_right": "swipe_left",
+    "swipe_up":    "swipe_down",
+    "swipe_down":  "swipe_up",
+}
 
 COLORS = {
     "swipe_left":  (255, 200,   0),
@@ -71,12 +80,20 @@ class SwipeDetector:
             torch.load(model_path, map_location=self.device, weights_only=True)
         )
         self.model.eval()
-        self.buf      = deque(maxlen=self.window_size)
-        self.cooldown = 0
+        self.buf          = deque(maxlen=self.window_size)
+        self.cooldown     = 0
+        self._opp_blocked = None   # label that is currently locked out
+        self._opp_frames  = 0      # frames remaining on opposite-direction lockout
 
     def update(self, px, py, scale):
         """Returns (label, confidence) or None."""
         self.buf.append((px, py, scale))
+
+        if self._opp_frames > 0:
+            self._opp_frames -= 1
+            if self._opp_frames == 0:
+                self._opp_blocked = None
+
         if self.cooldown > 0:
             self.cooldown -= 1
             return None
@@ -99,9 +116,17 @@ class SwipeDetector:
         if pred == self.none_idx or conf < CONFIDENCE_THRESHOLD:
             return None
 
-        self.cooldown = COOLDOWN_FRAMES
+        label = self.motions[pred]
+
+        # Suppress the return-to-center motion that looks like the opposite swipe
+        if label == self._opp_blocked:
+            return None
+
+        self.cooldown     = COOLDOWN_FRAMES
+        self._opp_blocked = OPPOSITES.get(label)
+        self._opp_frames  = OPPOSITE_LOCKOUT
         self.buf.clear()
-        return self.motions[pred], conf
+        return label, conf
 
 
 def main():
