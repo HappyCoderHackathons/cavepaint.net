@@ -1,0 +1,1 @@
+{"motions": ["swipe_left", "swipe_right", "swipe_up", "swipe_down", "none"], "num_classes": 5, "window_size": 30, "features_per_frame": 3}
