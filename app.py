@@ -175,6 +175,7 @@ async def stream_state(request):
                 "swipe_events": events,
                 "tracking": snapshot["tracking"],
                 "canvas_version": snapshot.get("canvas_version", 0),
+                "theta": _current_theta,
             })
             await response.write(f"data: {data}\n\n".encode())
     except (ConnectionResetError, asyncio.CancelledError):
@@ -311,6 +312,7 @@ async def api_session_frame(request):
 
 
 _POTATO_API = os.getenv("POTATO_API", "http://192.168.100.2:8080")
+_current_theta = 0.0   # cumulative camera mount angle in degrees
 
 async def api_motor_status(request):
     try:
@@ -340,6 +342,10 @@ async def api_rotate(request):
         )
         with urlopen(req, timeout=5) as resp:
             result = json.loads(resp.read())
+        global _current_theta
+        _current_theta += degrees
+        tracker.set_theta(_current_theta)
+        result["theta"] = _current_theta
         return web.Response(content_type="application/json", text=json.dumps(result))
     except URLError as exc:
         return web.Response(status=502, content_type="application/json",

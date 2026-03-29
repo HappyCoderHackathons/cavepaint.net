@@ -27,6 +27,8 @@ class Stroke:
     max_radius: int = 10
     min_radius: int = 2
 
+    theta: float = 0.0              # camera mount angle (degrees) when stroke was drawn
+
     # Input smoothing
     _smooth_alpha: float = 0.25   # EMA blend (0=no smoothing, 1=no follow)
     _min_dist: float = 2.0        # skip points closer than this (pixels)
