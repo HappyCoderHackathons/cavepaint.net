@@ -37,12 +37,37 @@ def compute_features(landmarks) -> np.ndarray:
 
 class GestureClassifier:
     def __init__(self):
-        meta = json.loads(GESTURE_META_PATH.read_text())
-        self.gestures = meta["gestures"]
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        meta = json.loads(GESTURE_META_PATH.read_text())
+        gestures_from_meta = meta["gestures"]
+
+        # Some deployments may have a gesture_meta.json that doesn't match the
+        # currently present gesture_model.pth class-count (e.g. meta includes
+        # "gun" but the checkpoint is still 4-class). If that happens, we
+        # infer the checkpoint's output dimension and truncate gestures so
+        # load_state_dict succeeds and point drawing keeps working.
+        state_dict = torch.load(
+            GESTURE_MODEL_PATH,
+            map_location=device,
+            weights_only=True,
+        )
+
+        num_classes_ckpt = None
+        for _, v in state_dict.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 2 and v.shape[1] == 32:
+                # Last Linear in _GestureMLP is Linear(32, num_classes), so its
+                # weight has shape (num_classes, 32).
+                num_classes_ckpt = int(v.shape[0])
+                break
+
+        if num_classes_ckpt is not None and num_classes_ckpt != len(gestures_from_meta):
+            self.gestures = gestures_from_meta[:num_classes_ckpt]
+        else:
+            self.gestures = gestures_from_meta
+
         model = _GestureMLP(num_classes=len(self.gestures)).to(device)
-        model.load_state_dict(torch.load(GESTURE_MODEL_PATH, map_location=device, weights_only=True))
+        model.load_state_dict(state_dict)
         model.eval()
         self.model = model
 
