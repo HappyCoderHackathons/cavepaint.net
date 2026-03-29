@@ -20,7 +20,7 @@ from stroke import Stroke, StrokeStore
 from swipe_detect import SwipeDetector
 from triangulate import depth_inches_to_str, triangulate
 
-from .camera import CameraReader, find_cameras, open_camera
+from .camera import CameraReader, ZmqCameraReader, find_cameras, open_camera
 from .constants import (
     GESTURE_CONFIDENCE,
     GESTURE_META_PATH,
@@ -659,20 +659,20 @@ class StereoDrawingTracker:
     # ------------------------------------------------------------------
 
     def _process_loop(self):
+        cap0 = None
         cap1 = None
         single_cam = True
         reader0 = None
         reader1 = None
         try:
-            cap0 = self._open_cam0()
-            cap1, single_cam = self._open_cam1()
+            cap0, reader0 = self._open_cam0()
+            cap1, reader1_or_none, single_cam = self._open_cam1()
 
-            reader0 = CameraReader(cap0)
             reader0.start()
             if single_cam:
                 reader1 = reader0
             else:
-                reader1 = CameraReader(cap1)
+                reader1 = reader1_or_none
                 reader1.start()
 
             gesture_clf = self._load_gesture_classifier()
@@ -708,13 +708,18 @@ class StereoDrawingTracker:
                 reader0.stop()
             if not single_cam and reader1 is not None:
                 reader1.stop()
-            cap0.release()
+            if cap0 is not None:
+                cap0.release()
             if cap1 is not None:
                 cap1.release()
 
     def _open_cam0(self):
+        if isinstance(self.cam0, str) and self.cam0.startswith("zmq://"):
+            reader = ZmqCameraReader(self.cam0, upscale_to=(self.width, self.height))
+            return None, reader
         try:
-            return open_camera(self.cam0, self.width, self.height)
+            cap = open_camera(self.cam0, self.width, self.height)
+            return cap, CameraReader(cap)
         except RuntimeError:
             available = find_cameras()
             if not available:
@@ -722,18 +727,23 @@ class StereoDrawingTracker:
                     self.output_frame = self._error_frame("No cameras found")
                 raise
             self.cam0 = available[0]
-            return open_camera(self.cam0, self.width, self.height)
+            cap = open_camera(self.cam0, self.width, self.height)
+            return cap, CameraReader(cap)
 
     def _open_cam1(self):
+        if isinstance(self.cam1, str) and self.cam1.startswith("zmq://"):
+            reader = ZmqCameraReader(self.cam1, upscale_to=(self.width, self.height))
+            return None, reader, False
         try:
             cap1 = open_camera(self.cam1, self.width, self.height)
-            return cap1, False
+            return cap1, CameraReader(cap1), False
         except RuntimeError:
             available = [i for i in find_cameras() if i != self.cam0]
             if available:
                 self.cam1 = available[0]
-                return open_camera(self.cam1, self.width, self.height), False
-            return None, True
+                cap1 = open_camera(self.cam1, self.width, self.height)
+                return cap1, CameraReader(cap1), False
+            return None, None, True
 
     def _load_gesture_classifier(self):
         if GESTURE_MODEL_PATH.exists() and GESTURE_META_PATH.exists():
