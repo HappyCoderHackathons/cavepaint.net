@@ -86,7 +86,7 @@ class MongoWhiteboardReplay:
             return max(1, int(default))
 
     @staticmethod
-    def _stroke_min_radius(max_radius: int, ratio: float = 0.65) -> int:
+    def _stroke_min_radius(max_radius: int, ratio: float = 0.50) -> int:
         max_r = max(1, int(max_radius))
         target = int(round(max_r * float(ratio)))
         lo = 3

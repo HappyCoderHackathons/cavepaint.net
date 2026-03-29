@@ -36,7 +36,7 @@
   <img id="caveBackgroundOverlay" 
     src="/static/images/cave_wall.jpg"
     alt=""
-    class="pointer-events-none fixed inset-0 z-0 h-full w-full object-cover opacity-[0.18]"
+    class="pointer-events-none fixed inset-0 z-0 h-[calc(100%-10px)] w-full translate-y-[-10px] object-cover opacity-[0.18]"
     draggable="false"
   >
   <main class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 p-4 sm:gap-6 sm:p-6 overflow-visible">
@@ -63,7 +63,7 @@
         muted
         class="h-full w-full object-contain"
       ></video>
-      <div class="pointer-events-none absolute inset-y-0 left-1/2 z-10 w-screen -translate-x-1/2">
+      <div class="pointer-events-none absolute inset-y-0 left-1/2 z-10 w-screen -translate-x-1/2 -translate-y-[10px]">
         <img
           id="caveFrameOverlay"
           src="/static/images/cave.png"
@@ -71,8 +71,8 @@
           class="absolute left-1/2 top-1/2 h-[140%] w-[300%] -translate-x-1/2 -translate-y-1/2 object-fill"
           style="
             filter: brightness(0.52) saturate(0.8);
-            -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 85%, transparent 100%);
-            mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 85%, transparent 100%);
+            -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 88%, transparent 100%);
+            mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 88%, transparent 100%);
           "
           draggable="false"
         >
@@ -80,8 +80,8 @@
           aria-hidden="true"
           class="absolute left-1/2 top-1/2 h-[140%] w-[300%] -translate-x-1/2 -translate-y-1/2 bg-[#73411d] opacity-[0.22] mix-blend-multiply"
           style="
-            -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 85%, transparent 100%);
-            mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 85%, transparent 100%);
+            -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 88%, transparent 100%);
+            mask-image: linear-gradient(to bottom, transparent 0%, black 14%, black 88%, transparent 100%);
           "
         ></div>
       </div>
@@ -102,20 +102,20 @@
     <section class="relative z-[70] px-1 py-2">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="flex items-center gap-3">
-          <span class="shrink-0 text-xs uppercase tracking-[0.2em] text-orange-100/90">Palette</span>
-          <div id="paletteSwatches" class="flex flex-wrap gap-2"></div>
+          <span class="shrink-0 text-sm uppercase tracking-[0.2em] text-orange-100/90">Palette</span>
+          <div id="paletteSwatches" class="flex flex-wrap gap-3"></div>
         </div>
         <div class="flex items-center gap-2">
-          <span class="text-[11px] uppercase tracking-[0.16em] text-orange-100/70">Stone Tools</span>
+          <span class="text-xs uppercase tracking-[0.16em] text-orange-100/70">Stone Tools</span>
         <button
           id="undoBtn"
-          class="rounded-full border border-stone-200/25 bg-gradient-to-b from-[#9b8f7f] via-[#746a5d] to-[#4a433b] px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-amber-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.28),0_6px_16px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px sm:text-sm"
+          class="rounded-full border border-stone-200/25 bg-gradient-to-b from-[#9b8f7f] via-[#746a5d] to-[#4a433b] px-5 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-amber-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.28),0_6px_16px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px sm:text-base"
         >
           Undo
         </button>
         <button
           id="clearBtn"
-          class="rounded-full border border-orange-100/20 bg-gradient-to-b from-[#8c6f61] via-[#684f45] to-[#42302a] px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-orange-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_6px_16px_rgba(0,0,0,0.42)] transition hover:brightness-110 active:translate-y-px sm:text-sm"
+          class="rounded-full border border-orange-100/20 bg-gradient-to-b from-[#8c6f61] via-[#684f45] to-[#42302a] px-5 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-orange-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_6px_16px_rgba(0,0,0,0.42)] transition hover:brightness-110 active:translate-y-px sm:text-base"
         >
           Clear
         </button>
@@ -124,19 +124,14 @@
     </section>
 
     <section class="pt-1">
-      <div class="mb-3 flex flex-wrap items-start justify-between gap-3">
-        <div>
+      <div class="mb-3">
+        <div class="w-full">
           <h2 class="font-display text-lg text-chalk sm:text-xl">Whiteboard Viewer</h2>
-          <p class="text-xs text-orange-100/85 sm:text-sm">Drag left/right on the board to rotate your view.</p>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <label class="px-1 py-1">
-            <div class="mb-1 text-[11px] uppercase tracking-[0.14em] text-orange-100/80">FOV (deg)</div>
-            <input id="fovRange" type="range" min="30" max="150" step="1" value="80" class="w-44">
-            <div id="fovValue" class="mt-1 text-xs font-semibold text-amber-200">80</div>
-          </label>
-          <div id="yawReadout" class="px-2 py-1 text-xs font-semibold text-amber-200">
-            Yaw 0.0°
+          <div class="mt-1 flex flex-wrap items-center justify-between gap-2">
+            <p class="text-xs text-orange-100/85 sm:text-sm">Drag left/right on the board to rotate your view.</p>
+            <div id="yawReadout" class="shrink-0 px-2 py-1 text-sm font-semibold text-chalk sm:text-base">
+              Yaw 0.0°
+            </div>
           </div>
         </div>
       </div>
@@ -161,21 +156,18 @@
     const whiteboardImg = document.getElementById("whiteboardImg");
     const boardSurface = document.getElementById("boardSurface");
 
-    const fovRange = document.getElementById("fovRange");
-    const fovValue = document.getElementById("fovValue");
     const yawReadout = document.getElementById("yawReadout");
 
     const undoBtn = document.getElementById("undoBtn");
     const clearBtn = document.getElementById("clearBtn");
 
-    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
     const normalize360 = (value) => {
       const wrapped = value % 360;
       return wrapped < 0 ? wrapped + 360 : wrapped;
     };
 
     let yaw = 0.0;
-    let fov = 80.0;
+    const fov = 80.0;
     let dragging = false;
     let dragStartX = 0;
     let dragStartYaw = 0;
@@ -184,8 +176,6 @@
     let lastObjectUrl = null;
 
     function syncLabels() {
-      fovRange.value = Math.round(fov).toString();
-      fovValue.textContent = Math.round(fov).toString();
       yawReadout.textContent = `View ${normalize360(yaw).toFixed(1)}°`;
     }
 
@@ -230,12 +220,6 @@
         markBoardDirty();
       }
     }
-
-    fovRange.addEventListener("input", () => {
-      fov = clamp(Number(fovRange.value) || 80, 30, 150);
-      syncLabels();
-      markBoardDirty();
-    });
 
     undoBtn.addEventListener("click", () => postAction("/undo"));
     clearBtn.addEventListener("click", () => postAction("/clear"));
@@ -349,14 +333,31 @@
       palette.forEach((hex, i) => {
         const btn = document.createElement("button");
         btn.style.backgroundColor = hex;
-        btn.style.width = "28px";
-        btn.style.height = "28px";
-        btn.style.borderRadius = "6px";
+        btn.style.width = "38px";
+        btn.style.height = "38px";
+        btn.style.borderRadius = "9px";
         btn.style.border = i === activeColorIdx
           ? "3px solid #fff"
           : "2px solid rgba(255,255,255,0.2)";
+        btn.style.transition = "filter 120ms ease, box-shadow 120ms ease, transform 120ms ease";
+        btn.style.filter = "brightness(1) saturate(1)";
+        btn.style.boxShadow = i === activeColorIdx
+          ? "0 0 0 2px rgba(255,255,255,0.2), 0 6px 14px rgba(0,0,0,0.35)"
+          : "0 4px 10px rgba(0,0,0,0.3)";
         btn.style.cursor = "pointer";
         btn.title = hex;
+        btn.addEventListener("mouseenter", () => {
+          btn.style.filter = "brightness(1.35) saturate(1.25)";
+          btn.style.boxShadow = "0 0 0 2px rgba(255,240,210,0.45), 0 8px 18px rgba(0,0,0,0.45)";
+          btn.style.transform = "translateY(-1px)";
+        });
+        btn.addEventListener("mouseleave", () => {
+          btn.style.filter = "brightness(1) saturate(1)";
+          btn.style.boxShadow = i === activeColorIdx
+            ? "0 0 0 2px rgba(255,255,255,0.2), 0 6px 14px rgba(0,0,0,0.35)"
+            : "0 4px 10px rgba(0,0,0,0.3)";
+          btn.style.transform = "translateY(0)";
+        });
         btn.addEventListener("click", () => {
           fetch("/color", {
             method: "POST",
