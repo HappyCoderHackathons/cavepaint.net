@@ -41,10 +41,17 @@
   >
   <main class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 p-4 sm:gap-6 sm:p-6 overflow-visible">
     <section class="pointer-events-none relative z-50 flex items-start justify-between">
-      <div>
+      <div class="relative">
         <h1 class="font-display text-4xl leading-tight text-orange-100 drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)] sm:text-6xl">
           Cavepaint.net
         </h1>
+        <a
+          href="/gallery"
+          class="pointer-events-auto absolute left-0 top-full mt-1 inline-flex items-center text-xs font-semibold uppercase tracking-widest text-orange-100/60 transition hover:text-chalk sm:text-sm"
+        >
+          Open Gallery
+          <span aria-hidden="true" class="ml-1">&rarr;</span>
+        </a>
       </div>
       <img
         id="cavemanBackground"
@@ -123,6 +130,26 @@
         >
           Clear
         </button>
+          <span class="text-xs uppercase tracking-[0.16em] text-orange-100/70 ml-2">Camera</span>
+          <button
+            id="rotateLeftBtn"
+            class="rounded-full border border-stone-200/25 bg-gradient-to-b from-[#5a6f7f] via-[#3d5466] to-[#283845] px-4 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-sky-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_6px_16px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px disabled:opacity-40 sm:text-base"
+            title="Rotate camera left"
+          >← Left</button>
+          <input
+            id="rotateDegreesInput"
+            type="number"
+            value="90"
+            min="1"
+            max="360"
+            class="w-16 rounded-full border border-stone-200/20 bg-stone-800/60 px-3 py-3 text-center text-sm text-chalk focus:outline-none"
+            title="Degrees to rotate"
+          >
+          <button
+            id="rotateRightBtn"
+            class="rounded-full border border-stone-200/25 bg-gradient-to-b from-[#5a6f7f] via-[#3d5466] to-[#283845] px-4 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-sky-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_6px_16px_rgba(0,0,0,0.38)] transition hover:brightness-110 active:translate-y-px disabled:opacity-40 sm:text-base"
+            title="Rotate camera right"
+          >Right →</button>
         </div>
       </div>
     </section>
@@ -227,6 +254,32 @@
 
     undoBtn.addEventListener("click", () => postAction("/undo"));
     clearBtn.addEventListener("click", () => postAction("/clear"));
+
+    const rotateLeftBtn = document.getElementById("rotateLeftBtn");
+    const rotateRightBtn = document.getElementById("rotateRightBtn");
+    const rotateDegreesInput = document.getElementById("rotateDegreesInput");
+
+    async function rotate(direction) {
+      const degrees = parseFloat(rotateDegreesInput.value) || 90;
+      rotateLeftBtn.disabled = true;
+      rotateRightBtn.disabled = true;
+      try {
+        await fetch("/api/rotate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ degrees: direction * degrees }),
+        });
+      } finally {
+        // re-enable after a short delay so motor has time to finish
+        setTimeout(() => {
+          rotateLeftBtn.disabled = false;
+          rotateRightBtn.disabled = false;
+        }, Math.abs(degrees) / 360 * 3000 + 500);
+      }
+    }
+
+    rotateLeftBtn.addEventListener("click", () => rotate(-1));
+    rotateRightBtn.addEventListener("click", () => rotate(1));
 
     boardSurface.addEventListener("pointerdown", (event) => {
       dragging = true;

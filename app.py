@@ -4,6 +4,8 @@ import os
 import time
 from fractions import Fraction
 from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 import av
 import cv2
@@ -56,9 +58,13 @@ class StereoVideoTrack(VideoStreamTrack):
 # Server setup
 # ---------------------------------------------------------------------------
 
+def _parse_cam(env_var: str, default: str) -> int | str:
+    val = os.getenv(env_var, default)
+    return val if (val.startswith("http") or val.startswith("zmq://")) else int(val)
+
 tracker = StereoDrawingTracker(
-    cam0=int(os.getenv("CAM0", "2")),
-    cam1=int(os.getenv("CAM1", "1")),
+    cam0=_parse_cam("CAM0", "2"),
+    cam1=_parse_cam("CAM1", "1"),
 )
 tracker.start()
 
@@ -290,6 +296,33 @@ async def api_session_frame(request):
     )
 
 
+_POTATO_API = os.getenv("POTATO_API", "http://192.168.100.2:8080")
+
+async def api_rotate(request):
+    try:
+        if request.method == "POST":
+            body = await request.json()
+            degrees = float(body["degrees"])
+        else:
+            degrees = float(request.query["degrees"])
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return web.Response(status=400, text='{"error":"degrees required"}', content_type="application/json")
+
+    try:
+        req = Request(
+            f"{_POTATO_API}/rotate",
+            data=json.dumps({"degrees": degrees}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+        return web.Response(content_type="application/json", text=json.dumps(result))
+    except URLError as exc:
+        return web.Response(status=502, content_type="application/json",
+                            text=json.dumps({"error": f"potato unreachable: {exc}"}))
+
+
 async def on_shutdown(app):
     tracker.stop()
     await asyncio.gather(*[pc.close() for pc in pcs])
@@ -314,6 +347,8 @@ app.router.add_get("/replay/{session_id}", replay_page)
 app.router.add_get("/api/sessions", api_sessions)
 app.router.add_get("/api/sessions/{session_id}", api_session_info)
 app.router.add_get("/api/sessions/{session_id}/frame", api_session_frame)
+app.router.add_post("/api/rotate", api_rotate)
+app.router.add_get("/api/rotate", api_rotate)
 app.router.add_static("/static/", STATIC_DIR, show_index=False)
 
 if __name__ == "__main__":

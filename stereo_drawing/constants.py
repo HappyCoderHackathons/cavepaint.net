@@ -14,17 +14,31 @@ GESTURE_CONFIDENCE = 0.5
 SWIPE_DISPLAY_FRAMES = 35  # how long a swipe label stays on screen (~1 s)
 
 # 10-color palette (BGR) cycled by swipe left/right when palm is open
+# PALETTE = [
+#     ( 20,  20,  20),  # near-black
+#     (  0,   0, 220),  # red
+#     (  0, 140, 255),  # orange
+#     (  0, 220, 220),  # yellow
+#     (  0, 200,  60),  # green
+#     (200, 200,   0),  # cyan
+#     (220,  60,   0),  # blue
+#     (200,   0, 200),  # magenta
+#     (130,   0, 180),  # purple
+#     ( 19,  69, 139),  # brown
+# ]
+
+#CAVEMAN PALETTE
 PALETTE = [
-    ( 20,  20,  20),  # near-black
-    (  0,   0, 220),  # red
-    (  0, 140, 255),  # orange
-    (  0, 220, 220),  # yellow
-    (  0, 200,  60),  # green
-    (200, 200,   0),  # cyan
-    (220,  60,   0),  # blue
-    (200,   0, 200),  # magenta
-    (130,   0, 180),  # purple
-    ( 19,  69, 139),  # brown
+    (23, 26, 27), #Charcoal Black
+    (41, 58, 91), #Burnt Umber
+    (23, 160, 212), #Ochre Yellow
+    (46, 59, 142), #Iron Oxide Red
+    (227, 203, 175), #Pale Cave Blue
+    (60, 94, 182), #Terracotta
+    (123, 169, 201), #Sandstone
+    (199, 221, 232), #Bone White
+    (104, 116, 126), #Ash Gray
+    (79, 107, 95) #Moss Patina
 ]
 
 _PALM_INDICES     = [0, 5, 9, 13, 17]

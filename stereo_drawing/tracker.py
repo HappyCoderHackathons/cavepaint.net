@@ -20,7 +20,7 @@ from stroke import Stroke, StrokeStore
 from swipe_detect import SwipeDetector
 from triangulate import depth_inches_to_str, triangulate
 
-from .camera import CameraReader, find_cameras, open_camera
+from .camera import CameraReader, ZmqCameraReader, find_cameras, open_camera
 from .constants import (
     GESTURE_CONFIDENCE,
     GESTURE_META_PATH,
@@ -654,25 +654,57 @@ class StereoDrawingTracker:
             self._undo_last_drawing_doc()
             return "draw", None
 
+    def _submit_and_start_new_session(self):
+        prev_session = self._session_id
+
+        if self._was_drawing:
+            self._strokes.end()
+            self._finish_drawing_doc(status="completed")
+            self._was_drawing = False
+        if self._was_erasing:
+            self._finish_erase_action(status="completed")
+            self._was_erasing = False
+
+        self._strokes.clear()
+        self._erase_batches.clear()
+        self._active_drawing_id = None
+        self._active_draw_action_id = None
+        self._active_erase_action_id = None
+        self._active_erase_batch_id = None
+        self._seq = 0
+
+        self._session_id = uuid4().hex
+        if points_col is not None and erases_col is not None:
+            self._mongo_whiteboard = MongoWhiteboardReplay(
+                points_col=points_col,
+                erases_col=erases_col,
+                session_id=self._session_id,
+                refresh_interval_ms=WHITEBOARD_DB_REFRESH_MS,
+            )
+        else:
+            self._mongo_whiteboard = None
+
+        print(f"[session] Drawing session: {self._session_id} (submitted {prev_session})")
+
     # ------------------------------------------------------------------
     # Main processing loop
     # ------------------------------------------------------------------
 
     def _process_loop(self):
+        cap0 = None
         cap1 = None
         single_cam = True
         reader0 = None
         reader1 = None
         try:
-            cap0 = self._open_cam0()
-            cap1, single_cam = self._open_cam1()
+            cap0, reader0 = self._open_cam0()
+            cap1, reader1_or_none, single_cam = self._open_cam1()
 
-            reader0 = CameraReader(cap0)
             reader0.start()
             if single_cam:
                 reader1 = reader0
             else:
-                reader1 = CameraReader(cap1)
+                reader1 = reader1_or_none
                 reader1.start()
 
             gesture_clf = self._load_gesture_classifier()
@@ -708,13 +740,18 @@ class StereoDrawingTracker:
                 reader0.stop()
             if not single_cam and reader1 is not None:
                 reader1.stop()
-            cap0.release()
+            if cap0 is not None:
+                cap0.release()
             if cap1 is not None:
                 cap1.release()
 
     def _open_cam0(self):
+        if isinstance(self.cam0, str) and self.cam0.startswith("zmq://"):
+            reader = ZmqCameraReader(self.cam0, upscale_to=(self.width, self.height))
+            return None, reader
         try:
-            return open_camera(self.cam0, self.width, self.height)
+            cap = open_camera(self.cam0, self.width, self.height)
+            return cap, CameraReader(cap)
         except RuntimeError:
             available = find_cameras()
             if not available:
@@ -722,18 +759,23 @@ class StereoDrawingTracker:
                     self.output_frame = self._error_frame("No cameras found")
                 raise
             self.cam0 = available[0]
-            return open_camera(self.cam0, self.width, self.height)
+            cap = open_camera(self.cam0, self.width, self.height)
+            return cap, CameraReader(cap)
 
     def _open_cam1(self):
+        if isinstance(self.cam1, str) and self.cam1.startswith("zmq://"):
+            reader = ZmqCameraReader(self.cam1, upscale_to=(self.width, self.height))
+            return None, reader, False
         try:
             cap1 = open_camera(self.cam1, self.width, self.height)
-            return cap1, False
+            return cap1, CameraReader(cap1), False
         except RuntimeError:
             available = [i for i in find_cameras() if i != self.cam0]
             if available:
                 self.cam1 = available[0]
-                return open_camera(self.cam1, self.width, self.height), False
-            return None, True
+                cap1 = open_camera(self.cam1, self.width, self.height)
+                return cap1, CameraReader(cap1), False
+            return None, None, True
 
     def _load_gesture_classifier(self):
         if GESTURE_MODEL_PATH.exists() and GESTURE_META_PATH.exists():
@@ -837,6 +879,8 @@ class StereoDrawingTracker:
                 _resize_cooldown -= 1
                 drawing = False
 
+            submit_swipe_up = False
+
             # Swipe detection
             if res0.hand_landmarks and swipe_det:
                 lms = res0.hand_landmarks[0]
@@ -852,7 +896,9 @@ class StereoDrawingTracker:
                         self._color_idx = (self._color_idx + 1) % len(PALETTE)
                     elif label == "swipe_left":
                         self._color_idx = (self._color_idx - 1) % len(PALETTE)
-                    if label in ("swipe_left", "swipe_right"):
+                    elif label == "swipe_up":
+                        submit_swipe_up = True
+                    if label in ("swipe_left", "swipe_right", "swipe_up"):
                         swipe_events.append((label, self._color_idx, SWIPE_DISPLAY_FRAMES))
 
             pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
@@ -912,6 +958,10 @@ class StereoDrawingTracker:
             z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
+                if submit_swipe_up:
+                    self._submit_and_start_new_session()
+                    self._canvas_version += 1
+
                 if erasing and tip0 and not self._was_erasing:
                     self._start_erase_action()
                 elif (not erasing or not tip0) and self._was_erasing:
