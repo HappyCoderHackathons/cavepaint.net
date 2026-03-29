@@ -216,6 +216,7 @@ class StrokeStore:
         self._active: Stroke | None = None
         self._cache: np.ndarray | None = None
         self._erase_canvas: np.ndarray | None = None
+        self._erase_ops: list[tuple[float, float, float]] = []
         self._dirty = False
         self._pixel_edited = False
         self.min_radius = 5
@@ -293,10 +294,11 @@ class StrokeStore:
     def erase_near(self, x: float, y: float, radius: float = 40.0):
         pt = (int(x), int(y))
         r  = int(radius)
+        # Record op so render_layered can replay it without needing _cache
+        self._erase_ops.append((float(x), float(y), float(radius)))
         if self._cache is not None:
             cv2.circle(self._cache, pt, r, (0, 0, 0), -1, cv2.LINE_AA)
             self._pixel_edited = True
-            # Lazily init erase canvas (all-white = nothing erased) on first use
             if self._erase_canvas is None:
                 self._erase_canvas = np.full(self._cache.shape, 255, dtype=np.uint8)
             cv2.circle(self._erase_canvas, pt, r, (0, 0, 0), -1, cv2.LINE_AA)
@@ -307,6 +309,7 @@ class StrokeStore:
         self._active = None
         self._cache = None
         self._erase_canvas = None
+        self._erase_ops.clear()
         self._dirty = False
         self._pixel_edited = False
 
@@ -343,11 +346,10 @@ class StrokeStore:
         if active_layer == "infront":
             self._active.render(infront, project)
 
-        # Apply accumulated erase marks to both layers
-        if self._erase_canvas is not None and self._erase_canvas.shape == shape:
-            erased = ~self._erase_canvas.any(axis=2)  # True where black circles were drawn
-            behind[erased]  = 0
-            infront[erased] = 0
+        # Replay erase ops onto both layers
+        for ex, ey, er in self._erase_ops:
+            cv2.circle(behind,  (int(ex), int(ey)), int(er), (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(infront, (int(ex), int(ey)), int(er), (0, 0, 0), -1, cv2.LINE_AA)
 
         return behind, infront
 
