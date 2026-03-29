@@ -14,6 +14,7 @@ import argparse
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -22,6 +23,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import platform
+
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+import os
+from dotenv import load_dotenv
 
 from stroke import StrokeStore
 from triangulate import depth_inches_to_str, triangulate
@@ -39,6 +45,27 @@ GESTURE_CONFIDENCE = 0.5
 _FINGERTIP_INDICES = [4, 8, 12, 16, 20]
 _INPUT_DIM = 63 + 15  # 21 landmarks × 3 coords + 15 distance features
 
+# mongoDB setup
+
+load_dotenv()
+uri = os.getenv("MONGO_URI")
+drawings_col = None
+points_col = None
+erases_col = None
+
+if uri:
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        db = client["cavepainting"]
+        drawings_col = db["drawings"]
+        points_col = db["points"]
+        erases_col = db["erases"]
+        client.admin.command("ping")
+    except Exception as exc:
+        print(f"[mongo] Disabled (connection failed): {exc}")
+        drawings_col = None
+        points_col = None
+        erases_col = None
 
 class _GestureMLP(nn.Module):
     def __init__(self, num_classes):
@@ -139,9 +166,9 @@ def find_cameras(max_index=8) -> list[int]:
     for i in range(max_index + 1):
         # Make backend compatible for mac
         if platform.system() == 'Windows': 
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         else:
-            cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+            cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
 
         if cap.isOpened():
             found.append(i)
@@ -195,6 +222,82 @@ class StereoDrawingTracker:
         self._was_drawing = False
         self.running = False
         self.thread = None
+        self._active_drawing_id = None
+        self._seq = 0
+        self._mongo_enabled = drawings_col is not None and points_col is not None
+
+    @staticmethod
+    def _utcnow():
+        return datetime.now(timezone.utc)
+
+    def _start_drawing_doc(self):
+        if not self._mongo_enabled:
+            return
+        now = self._utcnow()
+        doc = {
+            "createdAt": now,
+            "updatedAt": now,
+            "endedAt": None,
+            "status": "active",
+            "pointCount": 0,
+            "color": "black",
+            "rigRotationDeg": 0,
+        }
+        try:
+            result = drawings_col.insert_one(doc)
+            self._active_drawing_id = result.inserted_id
+            self._seq = 0
+        except PyMongoError as exc:
+            print(f"[mongo] drawing insert failed: {exc}")
+            self._active_drawing_id = None
+
+    def _insert_point_doc(self, x, y, z):
+        if not self._mongo_enabled or self._active_drawing_id is None:
+            return
+        point_doc = {
+            "drawingId": self._active_drawing_id,
+            "seq": self._seq,
+            "t": self._utcnow(),
+            "position": {"x": float(x), "y": float(y), "z": float(z)},
+            "rigRotationDeg": 0,
+            "color": "black",
+        }
+        try:
+            points_col.insert_one(point_doc)
+            self._seq += 1
+        except PyMongoError as exc:
+            print(f"[mongo] point insert failed: {exc}")
+
+    def _insert_erase_doc(self, x, y, radius):
+        if erases_col is None:
+            return
+        erase_doc = {
+            "x": float(x),
+            "y": float(y),
+            "radius": float(radius),
+            "t": self._utcnow(),
+        }
+        if self._active_drawing_id is not None:
+            erase_doc["drawingId"] = self._active_drawing_id
+        try:
+            erases_col.insert_one(erase_doc)
+        except PyMongoError as exc:
+            print(f"[mongo] erase insert failed: {exc}")
+
+    def _finish_drawing_doc(self, status="completed"):
+        if not self._mongo_enabled or self._active_drawing_id is None:
+            return
+        now = self._utcnow()
+        try:
+            drawings_col.update_one(
+                {"_id": self._active_drawing_id},
+                {"$set": {"updatedAt": now, "endedAt": now, "status": status, "pointCount": self._seq}},
+            )
+        except PyMongoError as exc:
+            print(f"[mongo] drawing finalize failed: {exc}")
+        finally:
+            self._active_drawing_id = None
+            self._seq = 0
 
     def clear_canvas(self):
         with self.lock:
@@ -334,16 +437,22 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 if self._was_drawing:
                                     self._strokes.end()
-                                self._strokes.erase_near(tip0[0], tip0[1], radius=30)
+                                    self._finish_drawing_doc(status="completed")
+                                erase_radius = 30
+                                self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
+                                self._insert_erase_doc(tip0[0], tip0[1], erase_radius)
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
                                     self._strokes.begin()
+                                    self._start_drawing_doc()
                                 self._strokes.add_point(tip0[0], tip0[1], z)
+                                self._insert_point_doc(tip0[0], tip0[1], z)
                                 self._was_drawing = True
                             else:
                                 if self._was_drawing:
                                     self._strokes.end()
+                                    self._finish_drawing_doc(status="completed")
                                 self._was_drawing = False
 
                             stroke_canvas = self._strokes.render(combined.shape)
@@ -360,6 +469,10 @@ class StereoDrawingTracker:
             with self.lock:
                 self.output_frame = self._error_frame(f"Stereo tracker error: {exc}")
         finally:
+            if self._was_drawing:
+                self._strokes.end()
+                self._finish_drawing_doc(status="interrupted")
+                self._was_drawing = False
             reader0.stop()
             if not single_cam:
                 reader1.stop()
