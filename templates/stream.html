@@ -41,10 +41,17 @@
   >
   <main class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 p-4 sm:gap-6 sm:p-6 overflow-visible">
     <section class="pointer-events-none relative z-50 flex items-start justify-between">
-      <div>
+      <div class="relative">
         <h1 class="font-display text-4xl leading-tight text-orange-100 drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)] sm:text-6xl">
           Cavepaint.net
         </h1>
+        <a
+          href="/gallery"
+          class="pointer-events-auto absolute left-0 top-full mt-1 inline-flex items-center text-xs font-semibold uppercase tracking-widest text-orange-100/60 transition hover:text-chalk sm:text-sm"
+        >
+          Open Gallery
+          <span aria-hidden="true" class="ml-1">&rarr;</span>
+        </a>
       </div>
       <img
         id="cavemanBackground"
