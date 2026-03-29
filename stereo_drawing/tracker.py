@@ -137,19 +137,22 @@ class StereoDrawingTracker:
         if self._mongo_whiteboard is not None:
             ops = self._mongo_whiteboard.load_state()
 
-        if ops is None:
+        if ops is None or len(ops) == 0:
             with self.lock:
                 ops = [{"kind": "stroke", "stroke": s} for s in self._snapshot_strokes()]
 
         def project(px, py, pz):
             return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
 
-        board = np.full((height, width, 3), 255, dtype=np.uint8)
+        # Match live render semantics:
+        # draw strokes on a black layer, erase by overdrawing black circles on that layer,
+        # then composite non-black pixels onto a white board background.
+        stroke_layer = np.zeros((height, width, 3), dtype=np.uint8)
         for op in ops:
             if op.get("kind") == "stroke":
                 stroke = op.get("stroke")
                 if stroke is not None:
-                    stroke.render(board, project=project)
+                    stroke.render(stroke_layer, project=project)
                 continue
 
             if op.get("kind") == "erase":
@@ -157,11 +160,25 @@ class StereoDrawingTracker:
                 cy = float(op.get("y", 0.0))
                 cz = float(op.get("z", 0.0))
                 cr = float(op.get("radius", 30.0))
-                center = self._project_whiteboard_point(cx, cy, cz, yaw_rad, fov_rad, width, height)
-                if center is None:
-                    continue
-                draw_r = self._project_erase_radius(cx, cy, cz, cr, yaw_rad, fov_rad, width, height)
-                cv2.circle(board, center, draw_r, (255, 255, 255), -1, cv2.LINE_AA)
+                # Anchor erase at measured depth for accurate alignment, and sweep a
+                # small depth neighborhood so nearby z-layers are also cleared.
+                for ez in (cz - 4.0, cz, cz + 4.0):
+                    center = self._project_whiteboard_point(cx, cy, ez, yaw_rad, fov_rad, width, height)
+                    if center is None:
+                        continue
+                    draw_r = self._project_erase_radius(cx, cy, ez, cr, yaw_rad, fov_rad, width, height)
+                    cv2.circle(
+                        stroke_layer,
+                        (int(round(center[0])), int(round(center[1]))),
+                        int(max(1, round(draw_r * 1.08))),
+                        (0, 0, 0),
+                        -1,
+                        cv2.LINE_AA,
+                    )
+
+        board = np.full((height, width, 3), 255, dtype=np.uint8)
+        ink_mask = stroke_layer.any(axis=2)
+        board[ink_mask] = stroke_layer[ink_mask]
 
         cv2.putText(
             board,
@@ -253,17 +270,25 @@ class StereoDrawingTracker:
     def _snapshot_strokes(self):
         strokes = []
         for src in self._strokes._completed:
-            dst = Stroke(color=src.color, max_radius=src.max_radius, min_radius=src.min_radius)
-            dst.pts = list(src.pts)
-            dst.times = list(src.times)
-            strokes.append(dst)
+            strokes.append(self._clone_stroke(src))
         active = self._strokes._active
         if active and not active.empty():
-            dst = Stroke(color=active.color, max_radius=active.max_radius, min_radius=active.min_radius)
-            dst.pts = list(active.pts)
-            dst.times = list(active.times)
-            strokes.append(dst)
+            strokes.append(self._clone_stroke(active))
         return strokes
+
+    @staticmethod
+    def _clone_stroke(src: Stroke) -> Stroke:
+        dst = Stroke(
+            color=src.color,
+            max_radius=src.max_radius,
+            min_radius=src.min_radius,
+            _smooth_alpha=src._smooth_alpha,
+            _min_dist=src._min_dist,
+            _dynamic_strength=src._dynamic_strength,
+        )
+        dst.pts = list(src.pts)
+        dst.times = list(src.times)
+        return dst
 
     @staticmethod
     def _project_whiteboard_point(x, y, z, yaw_rad, fov_rad, width, height):
@@ -285,7 +310,7 @@ class StereoDrawingTracker:
         v = (height * 0.5) + (yw * focal / zr)
         if u < -2 or u > width + 2 or v < -2 or v > height + 2:
             return None
-        return int(u), int(v)
+        return float(u), float(v)
 
     @staticmethod
     def _project_erase_radius(x, y, z, radius, yaw_rad, fov_rad, width, height):

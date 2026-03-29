@@ -30,7 +30,7 @@ class Stroke:
     # Input smoothing
     _smooth_alpha: float = 0.25   # EMA blend (0=no smoothing, 1=no follow)
     _min_dist: float = 2.0        # skip points closer than this (pixels)
-    _dynamic_strength: float = 0.6  # 0..1, lower = less width variation
+    _dynamic_strength: float = 0.7  # 0..1, lower = less width variation
 
     
     # --- mutation ----------------------------------------------------------
@@ -146,7 +146,7 @@ class Stroke:
                 out_pts.append(tuple(q.astype(int)))
                 out_radii.append((1.0 - t) * r1 + t * r2)
 
-        out_pts.append(px[-1])
+        out_pts.append((int(round(px[-1][0])), int(round(px[-1][1]))))
         out_radii.append(float(radii[-1]))
         return out_pts, out_radii
 
@@ -196,7 +196,8 @@ class Stroke:
 
         if pts:
             end_r = int(max(self.min_radius, min(self.max_radius, round(float(radii_seq[-1])))))
-            cv2.circle(canvas, pts[-1], end_r, self.color, -1, cv2.LINE_AA)
+            end_pt = (int(round(float(pts[-1][0]))), int(round(float(pts[-1][1]))))
+            cv2.circle(canvas, end_pt, end_r, self.color, -1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +221,7 @@ class StrokeStore:
         self.max_radius = 60
         self.current_radius = 10
         # decrease to allow more dynamic lines
-        self.dynamic_min_ratio = 0.55
+        self.dynamic_min_ratio = 0.50
 
     # --- stroke lifecycle --------------------------------------------------
 
