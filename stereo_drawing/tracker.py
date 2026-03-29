@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import cv2
@@ -67,6 +68,11 @@ class StereoDrawingTracker:
         self._tracking = {}
         self._sub_lock = threading.Lock()
         self._slots: list[StateSlot] = []
+        self._stone_alpha = 0.60
+        self._stone_scroll_per_turn = 3.5
+        self._stone_texture = self._load_stone_texture()
+        self._board_base_cache_unshifted = None
+        self._board_base_cache_size = None
         print(f"[session] Drawing session: {self._session_id}")
 
     # ------------------------------------------------------------------
@@ -178,21 +184,52 @@ class StereoDrawingTracker:
                         cv2.LINE_AA,
                     )
 
-        board = np.full((height, width, 3), 255, dtype=np.uint8)
+        board = self._get_whiteboard_base(width, height, yaw_deg).copy()
         ink_mask = stroke_layer.any(axis=2)
         board[ink_mask] = stroke_layer[ink_mask]
 
-        cv2.putText(
-            board,
-            f"Yaw {yaw_deg:.1f} deg | FOV {fov_deg:.0f} deg",
-            (12, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (40, 40, 40),
-            2,
-            cv2.LINE_AA,
-        )
         return board
+
+    def _load_stone_texture(self):
+        root_dir = Path(__file__).resolve().parent.parent
+        texture_path = root_dir / "static" / "images" / "stone.jpeg"
+        if not texture_path.exists():
+            return None
+        texture = cv2.imread(str(texture_path), cv2.IMREAD_COLOR)
+        return texture if texture is not None else None
+
+    def _get_whiteboard_base(self, width: int, height: int, yaw_deg: float):
+        cache_hit = (
+            self._board_base_cache_unshifted is not None
+            and self._board_base_cache_size == (width, height)
+        )
+        if cache_hit:
+            base_unshifted = self._board_base_cache_unshifted
+        else:
+            base_unshifted = np.full((height, width, 3), 255, dtype=np.uint8)
+            if self._stone_texture is not None:
+                texture = cv2.resize(
+                    self._stone_texture,
+                    (width, height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                base_unshifted = cv2.addWeighted(
+                    base_unshifted,
+                    1.0 - self._stone_alpha,
+                    texture,
+                    self._stone_alpha,
+                    0.0,
+                )
+            self._board_base_cache_unshifted = base_unshifted
+            self._board_base_cache_size = (width, height)
+
+        if width <= 1:
+            return base_unshifted
+
+        shift_px = int(round((float(yaw_deg) % 360.0) / 360.0 * width * self._stone_scroll_per_turn))
+        if shift_px == 0:
+            return base_unshifted
+        return np.roll(base_unshifted, shift=shift_px, axis=1)
 
     # ------------------------------------------------------------------
     # Static overlay helpers

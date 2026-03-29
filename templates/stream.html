@@ -250,7 +250,7 @@
     boardSurface.addEventListener("pointermove", (event) => {
       if (!dragging) return;
       const deltaX = event.clientX - dragStartX;
-      yaw = normalize360(dragStartYaw - deltaX * 0.22);
+      yaw = normalize360(dragStartYaw + deltaX * 0.22);
       syncLabels();
       markBoardDirty();
     });
