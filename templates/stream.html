@@ -40,6 +40,23 @@
       <div class="absolute left-3 top-3 rounded-md bg-black/40 px-2 py-1 text-xs sm:text-sm">
         Live Stereo Feed
       </div>
+      <div id="trackingHud" class="pointer-events-none absolute right-3 top-3 rounded-md bg-black/50 px-3 py-2 font-mono text-xs leading-5 text-slate-200">
+        <div id="hudCam">CAM  — / —</div>
+        <div id="hudTip0">TIP0 —</div>
+        <div id="hudTip1">TIP1 —</div>
+        <div id="hudXyz">XYZ  —</div>
+        <div id="hudHand">HAND —</div>
+        <div id="hudBrush">BRUSH —</div>
+        <div id="hudFps">FPS  —</div>
+      </div>
+      <div id="swipeOverlay" class="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <div id="swipeLabel" class="text-2xl font-bold tracking-widest uppercase transition-opacity duration-100" style="opacity:0;text-shadow:0 2px 8px #000a"></div>
+      </div>
+    </section>
+
+    <section class="flex items-center gap-3 rounded-2xl border border-white/10 bg-panel px-4 py-3 shadow-xl">
+      <span class="shrink-0 text-xs uppercase tracking-wide text-slate-300">Color</span>
+      <div id="paletteSwatches" class="flex flex-wrap gap-2"></div>
     </section>
 
     <section class="rounded-2xl border border-white/10 bg-slate p-3 shadow-xl sm:p-4">
@@ -274,6 +291,105 @@
     startWebRTC().catch((err) => {
       console.error("WebRTC start failed:", err);
     });
+
+    // -----------------------------------------------------------------------
+    // Color palette + swipe state
+    // -----------------------------------------------------------------------
+    const paletteSwatches = document.getElementById("paletteSwatches");
+    const swipeLabel = document.getElementById("swipeLabel");
+    const hudCam  = document.getElementById("hudCam");
+    const hudTip0 = document.getElementById("hudTip0");
+    const hudTip1 = document.getElementById("hudTip1");
+    const hudXyz  = document.getElementById("hudXyz");
+    const hudHand  = document.getElementById("hudHand");
+    const hudBrush = document.getElementById("hudBrush");
+    const hudFps   = document.getElementById("hudFps");
+
+    let palette = [];
+    let activeColorIdx = 0;
+    let swipeFadeTimer = null;
+
+    function renderPalette() {
+      paletteSwatches.innerHTML = "";
+      palette.forEach((hex, i) => {
+        const btn = document.createElement("button");
+        btn.style.backgroundColor = hex;
+        btn.style.width = "28px";
+        btn.style.height = "28px";
+        btn.style.borderRadius = "6px";
+        btn.style.border = i === activeColorIdx
+          ? "3px solid #fff"
+          : "2px solid rgba(255,255,255,0.2)";
+        btn.style.cursor = "pointer";
+        btn.title = hex;
+        btn.addEventListener("click", () => {
+          fetch("/color", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ idx: i }),
+          });
+          activeColorIdx = i;
+          renderPalette();
+        });
+        paletteSwatches.appendChild(btn);
+      });
+    }
+
+    function showSwipeLabel(label, color) {
+      swipeLabel.textContent = label.replace("_", " ");
+      swipeLabel.style.color = color;
+      swipeLabel.style.opacity = "1";
+      if (swipeFadeTimer) clearTimeout(swipeFadeTimer);
+      swipeFadeTimer = setTimeout(() => {
+        swipeLabel.style.opacity = "0";
+      }, 800);
+    }
+
+    let lastSwipeLabel = "";
+
+    function applyState(data) {
+      if (data.palette) palette = data.palette;
+
+      const needsRender = data.color_idx !== activeColorIdx || !paletteSwatches.children.length;
+      if (data.color_idx !== undefined) activeColorIdx = data.color_idx;
+      if (needsRender) renderPalette();
+
+      const t = data.tracking || {};
+      const fmt = (v) => v != null ? v.toFixed(1) : "—";
+      const fmtPx = (arr) => arr ? `${arr[0]},${arr[1]}` : "—";
+      const fmtXyz = (arr) => arr ? `${fmt(arr[0])} ${fmt(arr[1])} ${fmt(arr[2])}` : "—";
+      hudCam.textContent  = `CAM  ${t.cam0 ?? "—"} / ${t.cam1 ?? "—"}`;
+      hudTip0.textContent = `TIP0 ${fmtPx(t.tip0)}`;
+      hudTip1.textContent = `TIP1 ${fmtPx(t.tip1)}`;
+      hudXyz.textContent  = `XYZ  ${fmtXyz(t.pos3d)} in`;
+      hudHand.textContent  = `HAND  ${t.gesture ?? "—"}`;
+      hudBrush.textContent = `BRUSH ${t.brush_radius ?? "—"}px`;
+      hudFps.textContent   = `FPS   ${t.fps ?? "—"}`;
+
+      if (data.swipe_events && data.swipe_events.length) {
+        const top = data.swipe_events[data.swipe_events.length - 1];
+        const lbl = top.label;
+        if (lbl !== lastSwipeLabel && top.frames > 20) {
+          lastSwipeLabel = lbl;
+          const hex = palette[top.color_idx] || "#fff";
+          showSwipeLabel(lbl, hex);
+        }
+      } else {
+        lastSwipeLabel = "";
+      }
+    }
+
+    function connectStream() {
+      const es = new EventSource("/stream");
+      es.onmessage = (e) => {
+        try { applyState(JSON.parse(e.data)); } catch (_) {}
+      };
+      es.onerror = () => {
+        es.close();
+        setTimeout(connectStream, 1000);
+      };
+    }
+    connectStream();
   </script>
 </body>
 </html>

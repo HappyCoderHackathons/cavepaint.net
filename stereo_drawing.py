@@ -11,6 +11,7 @@ Also runnable standalone:
 """
 
 import argparse
+import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import platform
+import math
 
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -247,6 +249,29 @@ def _draw_hand(frame, landmarks, w, h):
 
 
 
+class _StateSlot:
+    """Latest-value holder bridging the processing thread to an asyncio SSE handler.
+
+    Calling put_threadsafe() from any thread always overwrites the current value and
+    signals the waiting coroutine. The handler always reads the *newest* state —
+    intermediate frames are silently dropped instead of queuing up.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self._value: dict | None = None
+        self._event = asyncio.Event()
+
+    def put_threadsafe(self, value: dict) -> None:
+        self._value = value
+        self._loop.call_soon_threadsafe(self._event.set)
+
+    async def get(self) -> dict:
+        await self._event.wait()
+        self._event.clear()
+        return self._value  # type: ignore[return-value]
+
+
 class StereoDrawingTracker:
     def __init__(self, cam0=2, cam1=1, width=640, height=480):
         self.cam0 = cam0
@@ -275,6 +300,10 @@ class StereoDrawingTracker:
             else None
         )
         self._color_idx = 0
+        self._swipe_events = []
+        self._tracking = {}
+        self._sub_lock = threading.Lock()
+        self._slots: list[_StateSlot] = []
         print(f"[session] Drawing session: {self._session_id}")
 
     @staticmethod
@@ -375,6 +404,33 @@ class StereoDrawingTracker:
             if self.output_frame is None:
                 return None
             return self.output_frame.copy()
+
+    def get_state(self):
+        with self.lock:
+            return {
+                "color_idx": self._color_idx,
+                "swipe_events": list(self._swipe_events),
+                "tracking": dict(self._tracking),
+            }
+
+    def set_color(self, idx: int):
+        with self.lock:
+            self._color_idx = idx % len(PALETTE)
+
+    def subscribe(self, loop: asyncio.AbstractEventLoop) -> _StateSlot:
+        slot = _StateSlot(loop)
+        with self._sub_lock:
+            self._slots.append(slot)
+        return slot
+
+    def unsubscribe(self, slot: _StateSlot) -> None:
+        with self._sub_lock:
+            self._slots = [s for s in self._slots if s is not slot]
+
+    def _push_state(self, snapshot: dict) -> None:
+        with self._sub_lock:
+            for slot in self._slots:
+                slot.put_threadsafe(snapshot)
 
     @staticmethod
     def _project_whiteboard_point(
@@ -558,13 +614,19 @@ class StereoDrawingTracker:
         swipe_events = []   # list of (label, new_color_idx, frames_remaining) — thread-local
         if SWIPE_MODEL_PATH.exists() and SWIPE_META_PATH.exists():
             try:
-                swipe_det = SwipeDetector(SWIPE_MODEL_PATH, SWIPE_META_PATH)
+                _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                swipe_det = SwipeDetector(SWIPE_MODEL_PATH, SWIPE_META_PATH, device=_device)
             except Exception:
                 pass
 
         try:
             with _make_landmarker() as lm0, _make_landmarker() as lm1:
                 with ThreadPoolExecutor(max_workers=2) as pool:
+                    _fps = 0.0
+                    _fps_count = 0
+                    _fps_t0 = time.monotonic()
+                    _smooth_pinch = 0.5
+                    _resize_cooldown = 0  # frames to block drawing after resize gesture ends
                     while self.running:
                         frame0 = reader0.get()
                         frame1 = reader1.get()
@@ -590,10 +652,14 @@ class StereoDrawingTracker:
                             f1 = pool.submit(_detect, lm1, frame1, ts)
                             res0, res1 = f0.result(), f1.result()
 
-                        tip0 = tip1 = None
+                        tip0 = tip1 = tip8 = tip12 = None
                         gesture = None
                         if res0.hand_landmarks:
-                            tip0 = _draw_hand(frame0, res0.hand_landmarks[0], w, h)
+                            hand = res0.hand_landmarks[0]
+                            tip0 = _draw_hand(frame0, hand, w, h)
+                            tip8 = hand[8]
+                            tip12 = hand[12]
+
                             if gesture_clf:
                                 gesture, conf = gesture_clf.classify(res0.hand_landmarks[0])
                                 if conf < GESTURE_CONFIDENCE:
@@ -601,8 +667,25 @@ class StereoDrawingTracker:
                         if res1.hand_landmarks:
                             tip1 = _draw_hand(frame1, res1.hand_landmarks[0], w, h)
 
-                        drawing = (gesture == "point") if gesture_clf else (tip0 is not None)
-                        erasing = (gesture == "fist") if gesture_clf else False
+                        #ADD NEW GESTURES HERE
+                        if gesture_clf:
+                            drawing  = (gesture == "point")
+                            resizing = (gesture == "peace")
+                            erasing  = (gesture == "fist")
+                        else:
+                            # No classifier loaded — require model, don't guess from tip presence
+                            drawing  = False
+                            resizing = False
+                            erasing  = False
+
+                        # Resize-to-draw cooldown: block drawing briefly after peace gesture ends
+                        if resizing:
+                            _resize_cooldown = 18  # ~0.6 s at 30 fps
+                        elif _resize_cooldown > 0:
+                            _resize_cooldown -= 1
+                            drawing = False
+
+
 
                         # Swipe detection — feed every frame, act only when open_hand
                         if res0.hand_landmarks and swipe_det:
@@ -638,7 +721,24 @@ class StereoDrawingTracker:
                             g_color = (0, 255, 0) if gesture == "point" else (0, 165, 255)
                             cv2.putText(frame0, gesture, (10, 65),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, g_color, 2, cv2.LINE_AA)
-                            
+
+                        # Resize gesture overlay — line + brush-size circle between fingertips
+                        if resizing and tip8 and tip12:
+                            px8  = (int(tip8.x  * w), int(tip8.y  * h))
+                            px12 = (int(tip12.x * w), int(tip12.y * h))
+                            mid  = ((px8[0] + px12[0]) // 2, (px8[1] + px12[1]) // 2)
+                            br   = self._strokes.current_radius  # safe: int read under GIL
+                            color = PALETTE[self._color_idx]
+                            # Line connecting the two fingertips
+                            cv2.line(frame0, px8, px12, (200, 200, 200), 1, cv2.LINE_AA)
+                            # Filled circle showing actual brush size
+                            cv2.circle(frame0, mid, br, color, -1, cv2.LINE_AA)
+                            cv2.circle(frame0, mid, br, (255, 255, 255), 1, cv2.LINE_AA)
+                            # Size label just to the right of the circle
+                            cv2.putText(frame0, f"{br}px",
+                                        (mid[0] + br + 6, mid[1] + 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
                         combined = cv2.hconcat([frame0, frame1])
 
                         if not single_cam:
@@ -655,7 +755,7 @@ class StereoDrawingTracker:
                                 if self._was_drawing:
                                     self._strokes.end()
                                     self._finish_drawing_doc(status="completed")
-                                erase_radius = 30
+                                erase_radius = self._strokes.current_radius
                                 self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
                                 self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
                                 self._was_drawing = False
@@ -674,6 +774,13 @@ class StereoDrawingTracker:
                                     sx, sy, sz = active.pts[-1]
                                     self._insert_point_doc(sx, sy, sz, color=active.color)
                                 self._was_drawing = True
+                            elif resizing and tip0 and tip8 and tip12:
+                                PINCH_MAX = 0.25
+                                raw_dist = math.hypot(tip12.x - tip8.x, tip12.y - tip8.y)
+                                pinch_norm = 1.0 - min(raw_dist / PINCH_MAX, 1.0)
+                                _smooth_pinch = 0.85 * _smooth_pinch + 0.15 * pinch_norm
+                                self._strokes.current_radius = self._strokes._radius(_smooth_pinch)
+
                             else:
                                 if self._was_drawing:
                                     self._strokes.end()
@@ -686,11 +793,34 @@ class StereoDrawingTracker:
 
                             # Erase cursor
                             if erasing and tip0:
-                                cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
+                                cv2.circle(combined, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)
 
-                            self._draw_swipe_events(combined, swipe_events, PALETTE)
-                            self._draw_palette(combined, PALETTE, self._color_idx)
+                            self._swipe_events = list(swipe_events)
+                            self._tracking = {
+                                "cam0": self.cam0,
+                                "cam1": None if single_cam else self.cam1,
+                                "tip0": list(tip0) if tip0 else None,
+                                "tip1": list(tip1) if tip1 else None,
+                                "pos3d": [round(v, 2) for v in pos3d] if pos3d else None,
+                                "gesture": gesture,
+                                "fps": round(_fps, 1),
+                                "brush_radius": self._strokes.current_radius,
+                            }
                             self.output_frame = combined
+                            _push = {
+                                "color_idx": self._color_idx,
+                                "swipe_events": list(self._swipe_events),
+                                "tracking": dict(self._tracking),
+                            }
+
+                        self._push_state(_push)
+
+                        _fps_count += 1
+                        _now = time.monotonic()
+                        if _now - _fps_t0 >= 0.5:
+                            _fps = _fps_count / (_now - _fps_t0)
+                            _fps_count = 0
+                            _fps_t0 = _now
 
                         swipe_events = [(lbl, ci, f - 1)
                                         for lbl, ci, f in swipe_events if f > 1]

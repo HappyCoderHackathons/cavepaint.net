@@ -16,7 +16,7 @@ import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 from torch.utils.data import DataLoader, TensorDataset
 
-GESTURES = ["open_hand", "point", "fist"]
+GESTURES = ["open_hand", "point", "fist", "peace"]
 NUM_CLASSES = len(GESTURES)
 
 FINGERTIP_INDICES = [4, 8, 12, 16, 20]
