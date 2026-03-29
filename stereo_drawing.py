@@ -14,6 +14,7 @@ import argparse
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -24,14 +25,39 @@ import torch.nn as nn
 import platform
 import math
 
-from stroke import StrokeStore
-from triangulate import depth_inches_to_str, triangulate
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+import os
+from dotenv import load_dotenv
 
-HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+from stroke import Stroke, StrokeStore
+from triangulate import depth_inches_to_str, triangulate
+from swipe_detect import SwipeDetector
+
+HAND_MODEL_PATH    = Path(__file__).with_name("hand_landmarker.task")
 GESTURE_MODEL_PATH = Path(__file__).with_name("gesture_model.pth")
-GESTURE_META_PATH = Path(__file__).with_name("gesture_meta.json")
-INDEX_FINGERTIP = 8
+GESTURE_META_PATH  = Path(__file__).with_name("gesture_meta.json")
+SWIPE_MODEL_PATH   = Path(__file__).with_name("swipe_model.pth")
+SWIPE_META_PATH    = Path(__file__).with_name("swipe_meta.json")
+INDEX_FINGERTIP    = 8
 GESTURE_CONFIDENCE = 0.5
+
+# 10-color palette (BGR) cycled by swipe left/right when palm is open
+PALETTE = [
+    (255, 255, 255),  # white
+    ( 20,  20,  20),  # near-black
+    (  0,   0, 220),  # red
+    (  0, 140, 255),  # orange
+    (  0, 220, 220),  # yellow
+    (  0, 200,  60),  # green
+    (200, 200,   0),  # cyan
+    (220,  60,   0),  # blue
+    (200,   0, 200),  # magenta
+    (130,   0, 180),  # purple
+    ( 19,  69, 139),  # brown
+]
+_PALM_INDICES       = [0, 5, 9, 13, 17]
+SWIPE_DISPLAY_FRAMES = 35   # how long a swipe label stays on screen (~1 s)
 
 # ---------------------------------------------------------------------------
 # Gesture classifier (mirrors preview.py)
@@ -40,6 +66,27 @@ GESTURE_CONFIDENCE = 0.5
 _FINGERTIP_INDICES = [4, 8, 12, 16, 20]
 _INPUT_DIM = 63 + 15  # 21 landmarks × 3 coords + 15 distance features
 
+# mongoDB setup
+
+load_dotenv()
+uri = os.getenv("MONGO_URI")
+drawings_col = None
+points_col = None
+erases_col = None
+
+if uri:
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        db = client["cavepainting"]
+        drawings_col = db["drawings"]
+        points_col = db["points"]
+        erases_col = db["erases"]
+        client.admin.command("ping")
+    except Exception as exc:
+        print(f"[mongo] Disabled (connection failed): {exc}")
+        drawings_col = None
+        points_col = None
+        erases_col = None
 
 class _GestureMLP(nn.Module):
     def __init__(self, num_classes):
@@ -196,6 +243,83 @@ class StereoDrawingTracker:
         self._was_drawing = False
         self.running = False
         self.thread = None
+        self._active_drawing_id = None
+        self._seq = 0
+        self._mongo_enabled = drawings_col is not None and points_col is not None
+        self._color_idx = 0
+
+    @staticmethod
+    def _utcnow():
+        return datetime.now(timezone.utc)
+
+    def _start_drawing_doc(self):
+        if not self._mongo_enabled:
+            return
+        now = self._utcnow()
+        doc = {
+            "createdAt": now,
+            "updatedAt": now,
+            "endedAt": None,
+            "status": "active",
+            "pointCount": 0,
+            "color": "black",
+            "rigRotationDeg": 0,
+        }
+        try:
+            result = drawings_col.insert_one(doc)
+            self._active_drawing_id = result.inserted_id
+            self._seq = 0
+        except PyMongoError as exc:
+            print(f"[mongo] drawing insert failed: {exc}")
+            self._active_drawing_id = None
+
+    def _insert_point_doc(self, x, y, z):
+        if not self._mongo_enabled or self._active_drawing_id is None:
+            return
+        point_doc = {
+            "drawingId": self._active_drawing_id,
+            "seq": self._seq,
+            "t": self._utcnow(),
+            "position": {"x": float(x), "y": float(y), "z": float(z)},
+            "rigRotationDeg": 0,
+            "color": "black",
+        }
+        try:
+            points_col.insert_one(point_doc)
+            self._seq += 1
+        except PyMongoError as exc:
+            print(f"[mongo] point insert failed: {exc}")
+
+    def _insert_erase_doc(self, x, y, radius):
+        if erases_col is None:
+            return
+        erase_doc = {
+            "x": float(x),
+            "y": float(y),
+            "radius": float(radius),
+            "t": self._utcnow(),
+        }
+        if self._active_drawing_id is not None:
+            erase_doc["drawingId"] = self._active_drawing_id
+        try:
+            erases_col.insert_one(erase_doc)
+        except PyMongoError as exc:
+            print(f"[mongo] erase insert failed: {exc}")
+
+    def _finish_drawing_doc(self, status="completed"):
+        if not self._mongo_enabled or self._active_drawing_id is None:
+            return
+        now = self._utcnow()
+        try:
+            drawings_col.update_one(
+                {"_id": self._active_drawing_id},
+                {"$set": {"updatedAt": now, "endedAt": now, "status": status, "pointCount": self._seq}},
+            )
+        except PyMongoError as exc:
+            print(f"[mongo] drawing finalize failed: {exc}")
+        finally:
+            self._active_drawing_id = None
+            self._seq = 0
 
     def clear_canvas(self):
         with self.lock:
@@ -210,6 +334,90 @@ class StereoDrawingTracker:
             if self.output_frame is None:
                 return None
             return self.output_frame.copy()
+
+    @staticmethod
+    def _project_whiteboard_point(
+        x: float,
+        y: float,
+        z: float,
+        yaw_rad: float,
+        fov_rad: float,
+        width: int,
+        height: int,
+    ):
+        # Normalize camera-space points around the original frame center.
+        xw = float(x) - 320.0
+        yw = float(y) - 240.0
+        zw = float(z) * 25.0 + 400.0
+
+        c = float(np.cos(yaw_rad))
+        s = float(np.sin(yaw_rad))
+        xr = c * xw + s * zw
+        zr = -s * xw + c * zw
+        if zr <= 5.0:
+            return None
+
+        half_fov = fov_rad * 0.5
+        horiz_angle = float(np.arctan2(xr, zr))
+        if abs(horiz_angle) > half_fov:
+            return None
+
+        focal = (width * 0.5) / np.tan(max(half_fov, 1e-4))
+        u = (width * 0.5) + (xr * focal / zr)
+        v = (height * 0.5) + (yw * focal / zr)
+        if u < -2 or u > width + 2 or v < -2 or v > height + 2:
+            return None
+        return int(u), int(v)
+
+    def _snapshot_strokes(self):
+        strokes = []
+        for src in self._strokes._completed:
+            dst = Stroke(color=src.color, max_radius=src.max_radius, min_radius=src.min_radius)
+            dst.pts = list(src.pts)
+            dst.times = list(src.times)
+            strokes.append(dst)
+        active = self._strokes._active
+        if active and not active.empty():
+            dst = Stroke(color=active.color, max_radius=active.max_radius, min_radius=active.min_radius)
+            dst.pts = list(active.pts)
+            dst.times = list(active.times)
+            strokes.append(dst)
+        return strokes
+
+    def render_whiteboard(self, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
+        width = int(np.clip(width, 320, 1920))
+        height = int(np.clip(height, 120, 1080))
+        yaw_deg = float(np.clip(yaw_deg, -85.0, 85.0))
+        fov_deg = float(np.clip(fov_deg, 30.0, 150.0))
+        yaw_rad = float(np.deg2rad(yaw_deg))
+        fov_rad = float(np.deg2rad(fov_deg))
+
+        with self.lock:
+            strokes = self._snapshot_strokes()
+
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+        def project(px, py, pz):
+            return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
+
+        for stroke in strokes:
+            stroke.render(canvas, project=project)
+
+        board = np.full((height, width, 3), 255, dtype=np.uint8)
+        mask = canvas.any(axis=2)
+        board[mask] = canvas[mask]
+
+        cv2.putText(
+            board,
+            f"Yaw {yaw_deg:+.1f} deg | FOV {fov_deg:.0f} deg",
+            (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (40, 40, 40),
+            2,
+            cv2.LINE_AA,
+        )
+        return board
 
     def start(self):
         if self.running:
@@ -261,6 +469,15 @@ class StereoDrawingTracker:
                 gesture_clf = _GestureClassifier()
             except Exception:
                 pass  # no model — draw always
+
+        # Load swipe detector if model exists
+        swipe_det    = None
+        swipe_events = []   # list of (label, new_color_idx, frames_remaining) — thread-local
+        if SWIPE_MODEL_PATH.exists() and SWIPE_META_PATH.exists():
+            try:
+                swipe_det = SwipeDetector(SWIPE_MODEL_PATH, SWIPE_META_PATH)
+            except Exception:
+                pass
 
         try:
             with _make_landmarker() as lm0, _make_landmarker() as lm1:
@@ -317,6 +534,26 @@ class StereoDrawingTracker:
                             drawing  = (tip0 is not None) and not erasing
                             
 
+                        # Swipe detection — feed every frame, act only when open_hand
+                        if res0.hand_landmarks and swipe_det:
+                            lms = res0.hand_landmarks[0]
+                            xs = [lms[i].x for i in _PALM_INDICES]
+                            ys = [lms[i].y for i in _PALM_INDICES]
+                            palm_x = sum(xs) / len(xs)
+                            palm_y = sum(ys) / len(ys)
+                            palm_sc = float(np.hypot(lms[12].x - lms[0].x,
+                                                     lms[12].y - lms[0].y))
+                            swipe = swipe_det.update(palm_x, palm_y, palm_sc)
+                            if swipe and gesture == "open_hand":
+                                label, _ = swipe
+                                if label == "swipe_right":
+                                    self._color_idx = (self._color_idx + 1) % len(PALETTE)
+                                elif label == "swipe_left":
+                                    self._color_idx = (self._color_idx - 1) % len(PALETTE)
+                                if label in ("swipe_left", "swipe_right"):
+                                    swipe_events.append((label, self._color_idx,
+                                                         SWIPE_DISPLAY_FRAMES))
+
                         pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
                         label0 = f"CAM {self.cam0}" + (" (left)" if not single_cam else "")
@@ -347,12 +584,17 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 if self._was_drawing:
                                     self._strokes.end()
-                                self._strokes.erase_near(tip0[0], tip0[1], radius=30)
+                                    self._finish_drawing_doc(status="completed")
+                                erase_radius = 30
+                                self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
+                                self._insert_erase_doc(tip0[0], tip0[1], erase_radius)
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
-                                    self._strokes.begin(max_radius=self._strokes.current_radius)
+                                    self._strokes.begin(color=PALETTE[self._color_idx], max_radius=self._strokes.current_radius)
+                                    self._start_drawing_doc()
                                 self._strokes.add_point(tip0[0], tip0[1], z)
+                                self._insert_point_doc(tip0[0], tip0[1], z)
                                 self._was_drawing = True
                             elif resizing and tip0 and tip8 and tip12:
                                 PINCH_MAX = 0.25
@@ -364,6 +606,7 @@ class StereoDrawingTracker:
                             else:
                                 if self._was_drawing:
                                     self._strokes.end()
+                                    self._finish_drawing_doc(status="completed")
                                 self._was_drawing = False
 
                             stroke_canvas = self._strokes.render(combined.shape)
@@ -374,18 +617,76 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
 
+                            self._draw_swipe_events(combined, swipe_events, PALETTE)
+                            self._draw_palette(combined, PALETTE, self._color_idx)
                             self.output_frame = combined
+
+                        swipe_events = [(lbl, ci, f - 1)
+                                        for lbl, ci, f in swipe_events if f > 1]
 
         except Exception as exc:
             with self.lock:
                 self.output_frame = self._error_frame(f"Stereo tracker error: {exc}")
         finally:
+            if self._was_drawing:
+                self._strokes.end()
+                self._finish_drawing_doc(status="interrupted")
+                self._was_drawing = False
             reader0.stop()
             if not single_cam:
                 reader1.stop()
             cap0.release()
             if cap1 is not None:
                 cap1.release()
+
+    @staticmethod
+    def _draw_swipe_events(frame, events, palette):
+        """Overlay recent swipe labels, fading out as frames_remaining drops."""
+        if not events:
+            return
+        h, w = frame.shape[:2]
+        y = h // 2 - 60
+        for label, color_idx, frames_left in events:
+            text   = label.upper().replace('_', ' ')
+            color  = palette[color_idx]
+            # Dim the label proportionally as it expires
+            alpha  = min(frames_left / 15.0, 1.0)
+            tcolor = tuple(int(c * alpha) for c in color)
+            font   = cv2.FONT_HERSHEY_SIMPLEX
+            scale  = 1.2
+            thick  = 3
+            sz     = cv2.getTextSize(text, font, scale, thick)[0]
+            x      = (w - sz[0]) // 2
+            cv2.putText(frame, text, (x, y), font, scale, tcolor, thick, cv2.LINE_AA)
+            y     += sz[1] + 12
+
+    @staticmethod
+    def _draw_palette(frame, palette, active_idx):
+        """Draw a color palette strip at the bottom center of the frame."""
+        h, w = frame.shape[:2]
+        swatch = 36
+        gap    = 6
+        total  = len(palette) * (swatch + gap) - gap
+        x0     = (w - total) // 2
+        y0     = h - swatch - 10
+
+        # Dim background strip
+        cv2.rectangle(frame, (x0 - 8, y0 - 18), (x0 + total + 8, y0 + swatch + 8),
+                      (30, 30, 30), -1)
+
+        for i, color in enumerate(palette):
+            x = x0 + i * (swatch + gap)
+            cv2.rectangle(frame, (x, y0), (x + swatch, y0 + swatch), color, -1)
+            if i == active_idx:
+                cv2.rectangle(frame, (x - 2, y0 - 2),
+                              (x + swatch + 2, y0 + swatch + 2), (255, 255, 255), 2)
+                # Indicator triangle above active swatch
+                cx = x + swatch // 2
+                pts = np.array([[cx, y0 - 5], [cx - 5, y0 - 13], [cx + 5, y0 - 13]],
+                               dtype=np.int32)
+                cv2.fillPoly(frame, [pts], (255, 255, 255))
+            else:
+                cv2.rectangle(frame, (x, y0), (x + swatch, y0 + swatch), (70, 70, 70), 1)
 
     @staticmethod
     def _error_frame(message, width=1280, height=480):

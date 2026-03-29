@@ -1,51 +1,276 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Cavepaint</title>
-  <style>
-    body   { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; }
-    video  { display: block; max-width: 100%; }
-    button { margin: 12px; padding: 10px 28px; font-size: 1rem; background: #c0392b; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
-    button:hover { background: #e74c3c; }
-  </style>
-</head>
-<body>
-  <video id="video" autoplay playsinline muted></video>
-  <button onclick="fetch('/undo',  {method:'POST'})">Undo</button>
-  <button onclick="fetch('/clear', {method:'POST'})">Clear</button>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cavepaint Stream</title>
+  <script src="https://cdn.tailwindcss.com"></script>
   <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: "#0f172a",
+            slate: "#1f2937",
+            panel: "#111827",
+            accent: "#22c55e",
+          },
+          fontFamily: {
+            display: ["Sora", "ui-sans-serif", "system-ui"],
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="h-screen overflow-hidden bg-ink text-slate-100 font-display">
+  <main class="mx-auto flex h-full max-w-7xl flex-col gap-3 p-3 sm:gap-4 sm:p-4">
+    <section class="relative min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-panel shadow-xl">
+      <video
+        id="video"
+        autoplay
+        playsinline
+        muted
+        class="h-full w-full object-contain bg-black"
+      ></video>
+      <div class="pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-black/50 to-transparent"></div>
+      <div class="absolute left-3 top-3 rounded-md bg-black/40 px-2 py-1 text-xs sm:text-sm">
+        Live Stereo Feed
+      </div>
+    </section>
+
+    <section class="rounded-2xl border border-white/10 bg-slate p-3 shadow-xl sm:p-4">
+      <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h1 class="text-sm font-semibold sm:text-base">Whiteboard Viewer</h1>
+          <p class="text-xs text-slate-300 sm:text-sm">Drag left/right on the board to rotate view and clip by FOV.</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button id="undoBtn" class="rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-black transition hover:bg-amber-400 sm:text-sm">
+            Undo
+          </button>
+          <button id="clearBtn" class="rounded-lg bg-rose-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-rose-500 sm:text-sm">
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div class="mb-3 grid gap-3 sm:grid-cols-3">
+        <label class="rounded-lg bg-black/20 p-2">
+          <div class="mb-1 text-xs uppercase tracking-wide text-slate-300">Yaw (deg)</div>
+          <input id="yawRange" type="range" min="-85" max="85" step="0.1" value="0" class="w-full">
+          <div id="yawValue" class="mt-1 text-xs font-semibold text-accent">0.0</div>
+        </label>
+        <label class="rounded-lg bg-black/20 p-2">
+          <div class="mb-1 text-xs uppercase tracking-wide text-slate-300">FOV (deg)</div>
+          <input id="fovRange" type="range" min="30" max="150" step="1" value="80" class="w-full">
+          <div id="fovValue" class="mt-1 text-xs font-semibold text-accent">80</div>
+        </label>
+        <div class="rounded-lg bg-black/20 p-2">
+          <div class="mb-1 text-xs uppercase tracking-wide text-slate-300">Board Interaction</div>
+          <button id="resetViewBtn" class="rounded-md bg-zinc-200 px-3 py-1 text-xs font-semibold text-zinc-900 transition hover:bg-white">
+            Reset View
+          </button>
+          <p class="mt-2 text-xs text-slate-300">Click and drag horizontally to rotate camera yaw.</p>
+        </div>
+      </div>
+
+      <div
+        id="boardSurface"
+        class="relative h-[30vh] min-h-[180px] w-full select-none overflow-hidden rounded-xl border border-white/20 bg-white"
+      >
+        <img
+          id="whiteboardImg"
+          alt="Projected whiteboard drawing"
+          class="h-full w-full object-fill"
+          draggable="false"
+        >
+        <div class="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-black/10 to-transparent"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const video = document.getElementById("video");
+    const whiteboardImg = document.getElementById("whiteboardImg");
+    const boardSurface = document.getElementById("boardSurface");
+
+    const yawRange = document.getElementById("yawRange");
+    const fovRange = document.getElementById("fovRange");
+    const yawValue = document.getElementById("yawValue");
+    const fovValue = document.getElementById("fovValue");
+
+    const undoBtn = document.getElementById("undoBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const resetViewBtn = document.getElementById("resetViewBtn");
+
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+    let yaw = 0.0;
+    let fov = 80.0;
+    let dragging = false;
+    let dragStartX = 0;
+    let dragStartYaw = 0;
+    let boardBusy = false;
+    let boardDirty = true;
+    let lastObjectUrl = null;
+
+    function syncLabels() {
+      yawRange.value = yaw.toFixed(1);
+      fovRange.value = Math.round(fov).toString();
+      yawValue.textContent = yaw.toFixed(1);
+      fovValue.textContent = Math.round(fov).toString();
+    }
+
+    function markBoardDirty() {
+      boardDirty = true;
+    }
+
+    async function refreshWhiteboard() {
+      if (boardBusy) {
+        boardDirty = true;
+        return;
+      }
+      if (!boardDirty) return;
+      boardBusy = true;
+      boardDirty = false;
+
+      try {
+        const rect = boardSurface.getBoundingClientRect();
+        const width = Math.max(320, Math.round(rect.width));
+        const height = Math.max(120, Math.round(rect.height));
+
+        const url = `/whiteboard.png?yaw=${yaw.toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) return;
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        whiteboardImg.src = objectUrl;
+        if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+        lastObjectUrl = objectUrl;
+      } catch (_) {
+        // Keep UI responsive even if one whiteboard request fails.
+      } finally {
+        boardBusy = false;
+      }
+    }
+
+    async function postAction(path) {
+      try {
+        await fetch(path, { method: "POST" });
+      } finally {
+        markBoardDirty();
+      }
+    }
+
+    yawRange.addEventListener("input", () => {
+      yaw = clamp(Number(yawRange.value) || 0, -85, 85);
+      syncLabels();
+      markBoardDirty();
+    });
+
+    fovRange.addEventListener("input", () => {
+      fov = clamp(Number(fovRange.value) || 80, 30, 150);
+      syncLabels();
+      markBoardDirty();
+    });
+
+    resetViewBtn.addEventListener("click", () => {
+      yaw = 0;
+      fov = 80;
+      syncLabels();
+      markBoardDirty();
+    });
+
+    undoBtn.addEventListener("click", () => postAction("/undo"));
+    clearBtn.addEventListener("click", () => postAction("/clear"));
+
+    boardSurface.addEventListener("pointerdown", (event) => {
+      dragging = true;
+      dragStartX = event.clientX;
+      dragStartYaw = yaw;
+      boardSurface.setPointerCapture(event.pointerId);
+    });
+
+    boardSurface.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      const deltaX = event.clientX - dragStartX;
+      yaw = clamp(dragStartYaw + deltaX * 0.22, -85, 85);
+      syncLabels();
+      markBoardDirty();
+    });
+
+    function stopDrag(event) {
+      if (dragging) {
+        dragging = false;
+        if (typeof event.pointerId === "number") {
+          boardSurface.releasePointerCapture(event.pointerId);
+        }
+      }
+    }
+
+    boardSurface.addEventListener("pointerup", stopDrag);
+    boardSurface.addEventListener("pointercancel", stopDrag);
+    boardSurface.addEventListener("lostpointercapture", () => {
+      dragging = false;
+    });
+
+    window.addEventListener("resize", markBoardDirty);
+
+    setInterval(() => {
+      boardDirty = true;
+      refreshWhiteboard();
+    }, 120);
+
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     });
 
     pc.ontrack = (event) => {
-      document.getElementById('video').srcObject = event.streams[0];
+      video.srcObject = event.streams[0];
     };
 
-    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver("video", { direction: "recvonly" });
 
-    async function start() {
+    async function startWebRTC() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering before sending offer
-      await new Promise(resolve => {
-        if (pc.iceGatheringState === 'complete') { resolve(); return; }
-        pc.addEventListener('icegatheringstatechange', () => {
-          if (pc.iceGatheringState === 'complete') resolve();
-        });
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") {
+          resolve();
+          return;
+        }
+        const onStateChange = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", onStateChange);
+            resolve();
+          }
+        };
+        pc.addEventListener("icegatheringstatechange", onStateChange);
       });
 
-      const resp = await fetch('/offer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      const response = await fetch("/offer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type
+        })
       });
-      const answer = await resp.json();
+
+      const answer = await response.json();
       await pc.setRemoteDescription(answer);
     }
 
-    start();
+    syncLabels();
+    markBoardDirty();
+    startWebRTC().catch((err) => {
+      console.error("WebRTC start failed:", err);
+    });
   </script>
 </body>
 </html>
