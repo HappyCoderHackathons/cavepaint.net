@@ -20,7 +20,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-GESTURES = ["open_hand", "point", "fist", "peace"]
+GESTURES = ["open_hand", "point", "fist", "peace", "gun"]
 CYCLES = 5
 COUNTDOWN_SECONDS = 3
 RECORD_SECONDS = 8
