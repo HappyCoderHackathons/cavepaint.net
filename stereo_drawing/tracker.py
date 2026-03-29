@@ -703,6 +703,7 @@ class StereoDrawingTracker:
                     self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
                     self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
                     self._was_drawing = False
+                    self._canvas_version += 1
                 elif drawing and tip0:
                     if not self._was_drawing:
                         active_color = PALETTE[self._color_idx]
@@ -722,6 +723,7 @@ class StereoDrawingTracker:
                         sx, sy, sz = active.pts[-1]
                         point_radius = int(max(1, round(float(getattr(active, "max_radius", self._strokes.current_radius)))))
                         self._insert_point_doc(sx, sy, sz, color=active.color, brush_radius=point_radius)
+                        self._canvas_version += 1
                     self._was_drawing = True
                 elif resizing and tip0 and tip8 and tip12:
                     PINCH_MAX = 0.25
@@ -801,6 +803,7 @@ class StereoDrawingTracker:
                     "color_idx": self._color_idx,
                     "swipe_events": list(self._swipe_events),
                     "tracking": dict(self._tracking),
+                    "canvas_version": self._canvas_version,
                 }
 
             self._push_state(_push)

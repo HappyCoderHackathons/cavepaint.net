@@ -174,7 +174,7 @@
         const rect   = boardSurface.getBoundingClientRect();
         const width  = Math.max(320, Math.round(rect.width));
         const height = Math.max(120, Math.round(rect.height));
-        const url    = `/whiteboard.png?yaw=${wrap360(yaw).toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
+        const url    = `/whiteboard.jpg?yaw=${wrap360(yaw).toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
         const resp   = await fetch(url, { cache: "no-store" });
         if (!resp.ok) return;
         const blob   = await resp.blob();
@@ -231,14 +231,37 @@
 
     window.addEventListener("resize", () => { boardDirty = true; });
 
-    // Poll whiteboard every 100 ms
+    // SSE: refresh immediately whenever the canvas changes
+    let lastCanvasVersion = -1;
+
+    function connectStream() {
+      const es = new EventSource("/stream");
+      es.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          const v = data.canvas_version ?? -1;
+          if (v !== lastCanvasVersion) {
+            lastCanvasVersion = v;
+            boardDirty = true;
+            refreshWhiteboard();
+          }
+        } catch (_) {}
+      };
+      es.onerror = () => {
+        es.close();
+        setTimeout(connectStream, 1500);
+      };
+    }
+    connectStream();
+
+    // Fallback poll — covers initial load and SSE gaps
     setInterval(() => {
       if (document.hidden) return;
-      boardDirty = true;
       refreshWhiteboard();
-    }, 100);
+    }, 2000);
 
     syncLabels();
+    boardDirty = true;
     refreshWhiteboard();
   </script>
 </body>

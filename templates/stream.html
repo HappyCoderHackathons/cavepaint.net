@@ -198,7 +198,7 @@
         const height = Math.max(120, Math.round(rect.height));
 
         const yawForRequest = normalize360(yaw);
-        const url = `/whiteboard.png?yaw=${yawForRequest.toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
+        const url = `/whiteboard.jpg?yaw=${yawForRequest.toFixed(2)}&fov=${fov.toFixed(1)}&w=${width}&h=${height}&t=${Date.now()}`;
         const response = await fetch(url, { cache: "no-store" });
         if (!response.ok) return;
         const blob = await response.blob();
@@ -256,13 +256,11 @@
 
     window.addEventListener("resize", markBoardDirty);
 
-    const WHITEBOARD_REFRESH_MS = 100;
-
+    // Fallback poll — covers initial load and SSE reconnect gaps
     setInterval(() => {
       if (document.hidden) return;
-      boardDirty = true;
       refreshWhiteboard();
-    }, WHITEBOARD_REFRESH_MS);
+    }, 2000);
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
@@ -307,6 +305,7 @@
 
     syncLabels();
     markBoardDirty();
+    refreshWhiteboard();
     startWebRTC().catch((err) => {
       console.error("WebRTC start failed:", err);
     });
@@ -382,6 +381,7 @@
     }
 
     let lastSwipeLabel = "";
+    let lastCanvasVersion = -1;
 
     function applyState(data) {
       if (data.palette) palette = data.palette;
@@ -389,6 +389,13 @@
       const needsRender = data.color_idx !== activeColorIdx || !paletteSwatches.children.length;
       if (data.color_idx !== undefined) activeColorIdx = data.color_idx;
       if (needsRender) renderPalette();
+
+      const cv = data.canvas_version ?? -1;
+      if (cv !== lastCanvasVersion) {
+        lastCanvasVersion = cv;
+        markBoardDirty();
+        refreshWhiteboard();
+      }
 
       const t = data.tracking || {};
       const fmt = (v) => v != null ? v.toFixed(1) : "—";
