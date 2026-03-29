@@ -926,6 +926,10 @@ class StereoDrawingTracker:
                     if self._was_drawing:
                         self._strokes.end()
                         self._finish_drawing_doc(status="completed")
+                        # Ensure the just-committed stroke is materialized in cache
+                        # before we apply erase marks. Otherwise a draw->erase
+                        # transition can leave the new stroke out of the cached canvas.
+                        self._strokes.render(frame0.shape)
                     erase_radius = self._strokes.current_radius
                     self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
                     self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
