@@ -655,6 +655,9 @@ class StereoDrawingTracker:
         self._active_erase_action_id = None
         self._active_erase_batch_id = None
 
+    def _start_clear_action(self):
+        self.clear_canvas()
+
     def _record_local_erase_point(self, x, y, radius):
         if self._active_erase_batch_id is None:
             self._active_erase_batch_id = uuid4().hex
@@ -1023,8 +1026,9 @@ class StereoDrawingTracker:
                 drawing  = (gesture == "point")
                 resizing = (gesture == "peace")
                 erasing  = (gesture == "fist")
+                clearing = (gesture == "gun")
             else:
-                drawing = resizing = erasing = False
+                drawing = resizing = erasing = clearing = False
 
             if resizing:
                 action = "resizing"
@@ -1032,6 +1036,8 @@ class StereoDrawingTracker:
                 action = "drawing"
             elif erasing:
                 action = "erasing"
+            elif clearing:
+                action = "clearing"
             else:
                 action = "idle"
 
@@ -1226,6 +1232,8 @@ class StereoDrawingTracker:
                     if now_mono < _small_radius_lock_until:
                         next_radius = min(next_radius, _small_radius_lock_px)
                     self._strokes.current_radius = int(max(1, next_radius))
+                elif clearing:
+                    self._start_clear_action()
                 else:
                     if self._was_drawing:
                         self._strokes.end()
