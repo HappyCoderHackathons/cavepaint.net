@@ -598,7 +598,12 @@ class StereoDrawingTracker:
                     if not self._was_drawing:
                         active_color = PALETTE[self._color_idx]
                         active_radius = int(max(1, round(float(self._strokes.current_radius))))
-                        self._strokes.begin(color=active_color, max_radius=active_radius)
+                        active_min_radius = self._strokes.stroke_min_radius(active_radius)
+                        self._strokes.begin(
+                            color=active_color,
+                            max_radius=active_radius,
+                            min_radius=active_min_radius,
+                        )
                         self._start_drawing_doc(color=active_color, brush_radius=active_radius)
                     active = self._strokes._active
                     before_len = len(active.pts) if active is not None else 0

@@ -30,6 +30,7 @@ class Stroke:
     # Input smoothing
     _smooth_alpha: float = 0.25   # EMA blend (0=no smoothing, 1=no follow)
     _min_dist: float = 2.0        # skip points closer than this (pixels)
+    _dynamic_strength: float = 0.6  # 0..1, lower = less width variation
 
     
     # --- mutation ----------------------------------------------------------
@@ -56,48 +57,84 @@ class Stroke:
     def render(self, canvas: np.ndarray, project=None):
         if self.empty():
             return
-        px = self._project(project)
-        if len(px) < 2:
+        projected = self._project(project)
+        if len(projected) < 2:
             return
-        smooth_pts = self._catmull_rom(px)
-        self._draw(canvas, smooth_pts, self.max_radius)
+        px = [p for p, _ in projected]
+        ts = [t for _, t in projected]
+        base_radii = self._dynamic_radii(px, ts)
+        smooth_pts, smooth_radii = self._catmull_rom_with_radii(px, base_radii)
+        self._draw(canvas, smooth_pts, smooth_radii)
 
 
     def _project(self, project):
         if project:
-            out = [project(x, y, z) for x, y, z in self.pts]
-            return [p for p in out if p is not None]
-        return [(int(x), int(y)) for x, y, _ in self.pts]
+            out = []
+            for (x, y, z), t in zip(self.pts, self.times):
+                p = project(x, y, z)
+                if p is not None:
+                    out.append((p, float(t)))
+            return out
+        return [((int(x), int(y)), float(t)) for (x, y, _), t in zip(self.pts, self.times)]
 
-    # def _speeds(self) -> list:
-    #     """Speed in coordinate units per second between consecutive points."""
-    #     speeds = [0.0]
-    #     for i in range(1, len(self.pts)):
-    #         x0, y0, z0 = self.pts[i - 1]
-    #         x1, y1, z1 = self.pts[i]
-    #         dt = max(self.times[i] - self.times[i - 1], 1e-4)
-    #         dist = np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
-    #         speeds.append(dist / dt)
-    #     return speeds
+    def _dynamic_radii(self, px: list, ts: list) -> list:
+        n = len(px)
+        if n == 0:
+            return []
+        if n == 1:
+            return [float(self.max_radius)]
 
-    # def _radius(self, speed: float, max_spd: float) -> int:
-    #     norm = min(speed / max(max_spd, 1e-6), 1.0)
-    #     return max(self.min_radius, int(self.max_radius - norm * (self.max_radius - self.min_radius)))
+        seg_speeds = []
+        for i in range(1, n):
+            x0, y0 = px[i - 1]
+            x1, y1 = px[i]
+            dist = float(np.hypot(x1 - x0, y1 - y0))
+            dt = max(float(ts[i] - ts[i - 1]), 1e-3)
+            seg_speeds.append(dist / dt)
 
-    # def _radius(self, dist: float) -> int:
-    #     dist = max(0.0, min(1.0, dist))
-    #     return max(self.min_radius, int(self.max_radius - dist * (self.max_radius - self.min_radius)))
+        spd_ref = float(np.percentile(seg_speeds, 90)) if seg_speeds else 1.0
+        spd_ref = max(spd_ref, 1e-3)
 
+        raw_radii = []
+        for i in range(n):
+            if i == 0:
+                spd = seg_speeds[0]
+            elif i == n - 1:
+                spd = seg_speeds[-1]
+            else:
+                spd = 0.5 * (seg_speeds[i - 1] + seg_speeds[i])
+            norm = min(max(spd / spd_ref, 0.0), 1.0)
+            strength = min(max(float(self._dynamic_strength), 0.0), 1.0)
+            eff_norm = norm * strength
+            r = float(self.max_radius - eff_norm * (self.max_radius - self.min_radius))
+            raw_radii.append(max(float(self.min_radius), min(float(self.max_radius), r)))
 
-    def _catmull_rom(self, px: list, steps: int = 10):
+        # Radius smoothing keeps thickness transitions organic.
+        smooth_radii = []
+        alpha = 0.35
+        for r in raw_radii:
+            if smooth_radii:
+                smooth_radii.append(alpha * smooth_radii[-1] + (1.0 - alpha) * r)
+            else:
+                smooth_radii.append(r)
+        return smooth_radii
+
+    def _catmull_rom_with_radii(self, px: list, radii: list, steps: int = 10):
+        if len(px) < 2:
+            return list(px), list(radii)
+
         pts = [px[0]] + list(px) + [px[-1]]
+        rs = [radii[0]] + list(radii) + [radii[-1]]
 
         out_pts = []
+        out_radii = []
         for i in range(1, len(pts) - 2):
             p0 = np.array(pts[i - 1], dtype=float)
             p1 = np.array(pts[i],     dtype=float)
             p2 = np.array(pts[i + 1], dtype=float)
             p3 = np.array(pts[i + 2], dtype=float)
+            r1 = float(rs[i])
+            r2 = float(rs[i + 1])
             for j in range(steps):
                 t = j / steps
                 q = 0.5 * (
@@ -107,21 +144,37 @@ class Stroke:
                     + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3
                 )
                 out_pts.append(tuple(q.astype(int)))
+                out_radii.append((1.0 - t) * r1 + t * r2)
 
         out_pts.append(px[-1])
-        return out_pts
+        out_radii.append(float(radii[-1]))
+        return out_pts, out_radii
 
-    def _draw(self, canvas: np.ndarray, pts: list, radii: int):
+    def _draw(self, canvas: np.ndarray, pts: list, radii):
         n = len(pts)
+        if n == 0:
+            return
+
+        if isinstance(radii, (int, float)):
+            radii_seq = [float(radii)] * n
+        else:
+            radii_seq = [float(r) for r in radii]
+            if len(radii_seq) < n:
+                pad = radii_seq[-1] if radii_seq else float(self.max_radius)
+                radii_seq.extend([pad] * (n - len(radii_seq)))
+            elif len(radii_seq) > n:
+                radii_seq = radii_seq[:n]
+
         taper = min(10, n // 4)
 
         for i in range(n - 1):
-            r = radii
+            r = radii_seq[i]
             if taper > 0:
                 if i < taper:
-                    r = max(self.min_radius, r * (i + 1) // taper)
+                    r = max(self.min_radius, r * (i + 1) / taper)
                 elif i >= n - 1 - taper:
-                    r = max(self.min_radius, r * (n - 1 - i) // taper)
+                    r = max(self.min_radius, r * (n - 1 - i) / taper)
+            r = int(max(self.min_radius, min(self.max_radius, round(float(r)))))
 
 
             p1 = np.array(pts[i],     dtype=float)
@@ -142,7 +195,8 @@ class Stroke:
             cv2.circle(canvas, tuple(p1.astype(int)), r, self.color, -1, cv2.LINE_AA)
 
         if pts:
-            cv2.circle(canvas, pts[-1], radii, self.color, -1, cv2.LINE_AA)
+            end_r = int(max(self.min_radius, min(self.max_radius, round(float(radii_seq[-1])))))
+            cv2.circle(canvas, pts[-1], end_r, self.color, -1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +219,8 @@ class StrokeStore:
         self.min_radius = 5
         self.max_radius = 60
         self.current_radius = 10
+        # decrease to allow more dynamic lines
+        self.dynamic_min_ratio = 0.55
 
     # --- stroke lifecycle --------------------------------------------------
 
@@ -172,6 +228,15 @@ class StrokeStore:
         """Start a new stroke (ends any active stroke first)."""
         self._commit_active()
         self._active = Stroke(**kwargs)
+
+    def stroke_min_radius(self, max_radius: int) -> int:
+        max_r = max(1, int(max_radius))
+        target = int(round(max_r * float(self.dynamic_min_ratio)))
+        lo = max(1, int(self.min_radius))
+        hi = max(1, max_r - 1)
+        if hi < lo:
+            return max(1, min(max_r, lo))
+        return max(lo, min(hi, target))
     
     def _radius(self, dist: float) -> int:
         dist = max(0.0, min(1.0, dist))

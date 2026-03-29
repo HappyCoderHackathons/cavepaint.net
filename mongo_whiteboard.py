@@ -86,6 +86,16 @@ class MongoWhiteboardReplay:
             return max(1, int(default))
 
     @staticmethod
+    def _stroke_min_radius(max_radius: int, ratio: float = 0.65) -> int:
+        max_r = max(1, int(max_radius))
+        target = int(round(max_r * float(ratio)))
+        lo = 3
+        hi = max(1, max_r - 1)
+        if hi < lo:
+            return max(1, min(max_r, lo))
+        return max(lo, min(hi, target))
+
+    @staticmethod
     def _append_point(stroke: Stroke, x: float, y: float, z: float, event_time: float) -> None:
         before = len(stroke.pts)
         stroke.add(float(x), float(y), float(z))
@@ -193,9 +203,11 @@ class MongoWhiteboardReplay:
                 drawing_key = event["drawing_key"]
                 stroke = self._active_by_drawing.get(drawing_key)
                 if stroke is None:
+                    max_r = self._coerce_radius(event.get("brush_radius"), default=10)
                     stroke = Stroke(
                         color=event["color"],
-                        max_radius=self._coerce_radius(event.get("brush_radius"), default=10),
+                        max_radius=max_r,
+                        min_radius=self._stroke_min_radius(max_r),
                     )
                     self._active_by_drawing[drawing_key] = stroke
                 self._append_point(stroke, event["x"], event["y"], event["z"], event["t"])
