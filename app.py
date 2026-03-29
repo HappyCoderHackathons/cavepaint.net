@@ -127,6 +127,7 @@ async def state(request):
             "palette": PALETTE_HEX,
             "swipe_events": events,
             "tracking": s.get("tracking", {}),
+            "canvas_version": s.get("canvas_version", 0),
         }),
         headers={"Cache-Control": "no-store"},
     )
@@ -157,6 +158,7 @@ async def stream_state(request):
                 "palette": PALETTE_HEX,
                 "swipe_events": events,
                 "tracking": snapshot["tracking"],
+                "canvas_version": snapshot.get("canvas_version", 0),
             })
             await response.write(f"data: {data}\n\n".encode())
     except (ConnectionResetError, asyncio.CancelledError):
@@ -181,7 +183,7 @@ async def cameras(request):
     return web.Response(content_type="application/json", text=json.dumps(found))
 
 
-async def whiteboard(request):
+async def _render_whiteboard_response(request, fmt: str):
     try:
         yaw = float(request.query.get("yaw", "0"))
         fov = float(request.query.get("fov", "80"))
@@ -190,7 +192,6 @@ async def whiteboard(request):
     except ValueError:
         raise web.HTTPBadRequest(reason="Invalid whiteboard query params")
 
-    # Keep aiohttp loop responsive: do CPU-heavy render/encode off the event loop.
     frame = await asyncio.to_thread(
         tracker.render_whiteboard,
         yaw_deg=yaw,
@@ -198,14 +199,29 @@ async def whiteboard(request):
         width=width,
         height=height,
     )
-    ok, encoded = await asyncio.to_thread(cv2.imencode, ".png", frame)
+    if fmt == "jpg":
+        ok, encoded = await asyncio.to_thread(
+            cv2.imencode, ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88]
+        )
+        content_type = "image/jpeg"
+    else:
+        ok, encoded = await asyncio.to_thread(cv2.imencode, ".png", frame)
+        content_type = "image/png"
     if not ok:
         raise web.HTTPInternalServerError(reason="Failed to encode whiteboard image")
     return web.Response(
         body=encoded.tobytes(),
-        content_type="image/png",
+        content_type=content_type,
         headers={"Cache-Control": "no-store, max-age=0"},
     )
+
+
+async def whiteboard(request):
+    return await _render_whiteboard_response(request, "png")
+
+
+async def whiteboard_jpg(request):
+    return await _render_whiteboard_response(request, "jpg")
 
 
 async def on_shutdown(app):
@@ -226,6 +242,7 @@ app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_get("/whiteboard.png", whiteboard)
+app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
 app.router.add_static("/static/", STATIC_DIR, show_index=False)
 
 if __name__ == "__main__":
