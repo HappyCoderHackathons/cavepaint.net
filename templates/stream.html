@@ -40,6 +40,15 @@
       <div class="absolute left-3 top-3 rounded-md bg-black/40 px-2 py-1 text-xs sm:text-sm">
         Live Stereo Feed
       </div>
+      <div id="trackingHud" class="pointer-events-none absolute right-3 top-3 rounded-md bg-black/50 px-3 py-2 font-mono text-xs leading-5 text-slate-200"></div>
+      <div id="swipeOverlay" class="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <div id="swipeLabel" class="text-2xl font-bold tracking-widest uppercase transition-opacity duration-100" style="opacity:0;text-shadow:0 2px 8px #000a"></div>
+      </div>
+    </section>
+
+    <section class="flex items-center gap-3 rounded-2xl border border-white/10 bg-panel px-4 py-3 shadow-xl">
+      <span class="shrink-0 text-xs uppercase tracking-wide text-slate-300">Color</span>
+      <div id="paletteSwatches" class="flex flex-wrap gap-2"></div>
     </section>
 
     <section class="rounded-2xl border border-white/10 bg-slate p-3 shadow-xl sm:p-4">
@@ -271,6 +280,101 @@
     startWebRTC().catch((err) => {
       console.error("WebRTC start failed:", err);
     });
+
+    // -----------------------------------------------------------------------
+    // Color palette + swipe state
+    // -----------------------------------------------------------------------
+    const paletteSwatches = document.getElementById("paletteSwatches");
+    const swipeLabel = document.getElementById("swipeLabel");
+    const trackingHud = document.getElementById("trackingHud");
+
+    let palette = [];
+    let activeColorIdx = 0;
+    let swipeFadeTimer = null;
+
+    function renderPalette() {
+      paletteSwatches.innerHTML = "";
+      palette.forEach((hex, i) => {
+        const btn = document.createElement("button");
+        btn.style.backgroundColor = hex;
+        btn.style.width = "28px";
+        btn.style.height = "28px";
+        btn.style.borderRadius = "6px";
+        btn.style.border = i === activeColorIdx
+          ? "3px solid #fff"
+          : "2px solid rgba(255,255,255,0.2)";
+        btn.style.cursor = "pointer";
+        btn.title = hex;
+        btn.addEventListener("click", () => {
+          fetch("/color", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ idx: i }),
+          });
+          activeColorIdx = i;
+          renderPalette();
+        });
+        paletteSwatches.appendChild(btn);
+      });
+    }
+
+    function showSwipeLabel(label, color) {
+      swipeLabel.textContent = label.replace("_", " ");
+      swipeLabel.style.color = color;
+      swipeLabel.style.opacity = "1";
+      if (swipeFadeTimer) clearTimeout(swipeFadeTimer);
+      swipeFadeTimer = setTimeout(() => {
+        swipeLabel.style.opacity = "0";
+      }, 800);
+    }
+
+    let lastSwipeLabel = "";
+
+    async function pollState() {
+      try {
+        const res = await fetch("/state", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (data.palette && data.palette.length !== palette.length) {
+          palette = data.palette;
+        } else if (data.palette) {
+          palette = data.palette;
+        }
+
+        if (data.color_idx !== activeColorIdx) {
+          activeColorIdx = data.color_idx;
+          renderPalette();
+        } else if (palette.length && !paletteSwatches.children.length) {
+          renderPalette();
+        }
+
+        const t = data.tracking || {};
+        const fmt = (v) => v != null ? v.toFixed(1) : "—";
+        const fmtPx = (arr) => arr ? `${arr[0]},${arr[1]}` : "—";
+        const fmtXyz = (arr) => arr ? `${fmt(arr[0])} ${fmt(arr[1])} ${fmt(arr[2])}` : "—";
+        trackingHud.innerHTML =
+          `CAM  ${t.cam0 ?? "—"} / ${t.cam1 ?? "—"}<br>` +
+          `TIP0 ${fmtPx(t.tip0)}<br>` +
+          `TIP1 ${fmtPx(t.tip1)}<br>` +
+          `XYZ  ${fmtXyz(t.pos3d)} in<br>` +
+          `HAND ${t.gesture ?? "—"}`;
+
+        if (data.swipe_events && data.swipe_events.length) {
+          const top = data.swipe_events[data.swipe_events.length - 1];
+          const lbl = top.label;
+          if (lbl !== lastSwipeLabel && top.frames > 20) {
+            lastSwipeLabel = lbl;
+            const hex = palette[top.color_idx] || "#fff";
+            showSwipeLabel(lbl, hex);
+          }
+        } else {
+          lastSwipeLabel = "";
+        }
+      } catch (_) {}
+    }
+
+    setInterval(pollState, 100);
   </script>
 </body>
 </html>

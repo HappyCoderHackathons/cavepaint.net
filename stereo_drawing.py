@@ -247,6 +247,8 @@ class StereoDrawingTracker:
         self._seq = 0
         self._mongo_enabled = drawings_col is not None and points_col is not None
         self._color_idx = 0
+        self._swipe_events = []
+        self._tracking = {}
 
     @staticmethod
     def _utcnow():
@@ -334,6 +336,18 @@ class StereoDrawingTracker:
             if self.output_frame is None:
                 return None
             return self.output_frame.copy()
+
+    def get_state(self):
+        with self.lock:
+            return {
+                "color_idx": self._color_idx,
+                "swipe_events": list(self._swipe_events),
+                "tracking": dict(self._tracking),
+            }
+
+    def set_color(self, idx: int):
+        with self.lock:
+            self._color_idx = idx % len(PALETTE)
 
     @staticmethod
     def _project_whiteboard_point(
@@ -617,8 +631,15 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 cv2.circle(combined, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)
 
-                            self._draw_swipe_events(combined, swipe_events, PALETTE)
-                            self._draw_palette(combined, PALETTE, self._color_idx)
+                            self._swipe_events = list(swipe_events)
+                            self._tracking = {
+                                "cam0": self.cam0,
+                                "cam1": None if single_cam else self.cam1,
+                                "tip0": list(tip0) if tip0 else None,
+                                "tip1": list(tip1) if tip1 else None,
+                                "pos3d": [round(v, 2) for v in pos3d] if pos3d else None,
+                                "gesture": gesture,
+                            }
                             self.output_frame = combined
 
                         swipe_events = [(lbl, ci, f - 1)
