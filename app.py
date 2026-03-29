@@ -40,7 +40,7 @@ class StereoVideoTrack(VideoStreamTrack):
 
         frame = self.tracker.get_frame()
         if frame is None:
-            frame = np.zeros((480, 1280, 3), dtype=np.uint8)
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
         # Tracker frames are BGR already; avoid per-frame color conversion cost.
         video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")

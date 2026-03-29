@@ -639,12 +639,10 @@ class StereoDrawingTracker:
                 cv2.putText(frame0, f"{br}px", (mid[0] + br + 6, mid[1] + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-            combined = cv2.hconcat([frame0, frame1])
-
             if not single_cam:
                 depth_str = depth_inches_to_str(pos3d)
                 depth_color = (0, 255, 0) if pos3d else (100, 100, 100)
-                cv2.putText(combined, depth_str, (20, combined.shape[0] - 20),
+                cv2.putText(frame0, depth_str, (20, frame0.shape[0] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, depth_color, 2, cv2.LINE_AA)
 
             z = pos3d[2] if pos3d else 0.0
@@ -700,12 +698,12 @@ class StereoDrawingTracker:
                         self._finish_drawing_doc(status="completed")
                     self._was_drawing = False
 
-                stroke_canvas = self._strokes.render(combined.shape)
+                stroke_canvas = self._strokes.render(frame0.shape)
                 mask = stroke_canvas.any(axis=2)
-                combined[mask] = stroke_canvas[mask]
+                frame0[mask] = stroke_canvas[mask]
 
                 if erasing and tip0:
-                    cv2.circle(combined, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)
+                    cv2.circle(frame0, tip0, self._strokes.current_radius, (0, 0, 255), 2, cv2.LINE_AA)
 
                 self._swipe_events = list(swipe_events)
                 self._tracking = {
@@ -718,7 +716,7 @@ class StereoDrawingTracker:
                     "fps": round(_fps, 1),
                     "brush_radius": self._strokes.current_radius,
                 }
-                self.output_frame = combined
+                self.output_frame = frame0
                 _push = {
                     "color_idx": self._color_idx,
                     "swipe_events": list(self._swipe_events),
