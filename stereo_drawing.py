@@ -31,12 +31,31 @@ from dotenv import load_dotenv
 
 from stroke import StrokeStore
 from triangulate import depth_inches_to_str, triangulate
+from swipe_detect import SwipeDetector
 
-HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+HAND_MODEL_PATH    = Path(__file__).with_name("hand_landmarker.task")
 GESTURE_MODEL_PATH = Path(__file__).with_name("gesture_model.pth")
-GESTURE_META_PATH = Path(__file__).with_name("gesture_meta.json")
-INDEX_FINGERTIP = 8
+GESTURE_META_PATH  = Path(__file__).with_name("gesture_meta.json")
+SWIPE_MODEL_PATH   = Path(__file__).with_name("swipe_model.pth")
+SWIPE_META_PATH    = Path(__file__).with_name("swipe_meta.json")
+INDEX_FINGERTIP    = 8
 GESTURE_CONFIDENCE = 0.5
+
+# 10-color palette (BGR) cycled by swipe left/right when palm is open
+PALETTE = [
+    (255, 255, 255),  # white
+    ( 20,  20,  20),  # near-black
+    (  0,   0, 220),  # red
+    (  0, 140, 255),  # orange
+    (  0, 220, 220),  # yellow
+    (  0, 200,  60),  # green
+    (200, 200,   0),  # cyan
+    (220,  60,   0),  # blue
+    (200,   0, 200),  # magenta
+    (130,   0, 180),  # purple
+    ( 19,  69, 139),  # brown
+]
+_PALM_INDICES = [0, 5, 9, 13, 17]
 
 # ---------------------------------------------------------------------------
 # Gesture classifier (mirrors preview.py)
@@ -225,6 +244,7 @@ class StereoDrawingTracker:
         self._active_drawing_id = None
         self._seq = 0
         self._mongo_enabled = drawings_col is not None and points_col is not None
+        self._color_idx = 0
 
     @staticmethod
     def _utcnow():
@@ -364,6 +384,14 @@ class StereoDrawingTracker:
             except Exception:
                 pass  # no model — draw always
 
+        # Load swipe detector if model exists
+        swipe_det = None
+        if SWIPE_MODEL_PATH.exists() and SWIPE_META_PATH.exists():
+            try:
+                swipe_det = SwipeDetector(SWIPE_MODEL_PATH, SWIPE_META_PATH)
+            except Exception:
+                pass
+
         try:
             with _make_landmarker() as lm0, _make_landmarker() as lm1:
                 with ThreadPoolExecutor(max_workers=2) as pool:
@@ -404,8 +432,24 @@ class StereoDrawingTracker:
                             tip1 = _draw_hand(frame1, res1.hand_landmarks[0], w, h)
 
                         drawing = (gesture == "point") if gesture_clf else (tip0 is not None)
-
                         erasing = (gesture == "fist") if gesture_clf else False
+
+                        # Swipe detection — feed every frame, act only when open_hand
+                        if res0.hand_landmarks and swipe_det:
+                            lms = res0.hand_landmarks[0]
+                            xs = [lms[i].x for i in _PALM_INDICES]
+                            ys = [lms[i].y for i in _PALM_INDICES]
+                            palm_x = sum(xs) / len(xs)
+                            palm_y = sum(ys) / len(ys)
+                            palm_sc = float(np.hypot(lms[12].x - lms[0].x,
+                                                     lms[12].y - lms[0].y))
+                            swipe = swipe_det.update(palm_x, palm_y, palm_sc)
+                            if swipe and gesture == "open_hand":
+                                label, _ = swipe
+                                if label == "swipe_right":
+                                    self._color_idx = (self._color_idx + 1) % len(PALETTE)
+                                elif label == "swipe_left":
+                                    self._color_idx = (self._color_idx - 1) % len(PALETTE)
 
                         pos3d = triangulate(tip0, tip1) if (not single_cam and tip0 and tip1) else None
 
@@ -444,7 +488,7 @@ class StereoDrawingTracker:
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
-                                    self._strokes.begin()
+                                    self._strokes.begin(color=PALETTE[self._color_idx])
                                     self._start_drawing_doc()
                                 self._strokes.add_point(tip0[0], tip0[1], z)
                                 self._insert_point_doc(tip0[0], tip0[1], z)
@@ -463,6 +507,7 @@ class StereoDrawingTracker:
                             if erasing and tip0:
                                 cv2.circle(combined, tip0, 40, (0, 0, 255), 2, cv2.LINE_AA)
 
+                            self._draw_palette(combined, PALETTE, self._color_idx)
                             self.output_frame = combined
 
         except Exception as exc:
@@ -479,6 +524,34 @@ class StereoDrawingTracker:
             cap0.release()
             if cap1 is not None:
                 cap1.release()
+
+    @staticmethod
+    def _draw_palette(frame, palette, active_idx):
+        """Draw a color palette strip at the bottom center of the frame."""
+        h, w = frame.shape[:2]
+        swatch = 36
+        gap    = 6
+        total  = len(palette) * (swatch + gap) - gap
+        x0     = (w - total) // 2
+        y0     = h - swatch - 10
+
+        # Dim background strip
+        cv2.rectangle(frame, (x0 - 8, y0 - 18), (x0 + total + 8, y0 + swatch + 8),
+                      (30, 30, 30), -1)
+
+        for i, color in enumerate(palette):
+            x = x0 + i * (swatch + gap)
+            cv2.rectangle(frame, (x, y0), (x + swatch, y0 + swatch), color, -1)
+            if i == active_idx:
+                cv2.rectangle(frame, (x - 2, y0 - 2),
+                              (x + swatch + 2, y0 + swatch + 2), (255, 255, 255), 2)
+                # Indicator triangle above active swatch
+                cx = x + swatch // 2
+                pts = np.array([[cx, y0 - 5], [cx - 5, y0 - 13], [cx + 5, y0 - 13]],
+                               dtype=np.int32)
+                cv2.fillPoly(frame, [pts], (255, 255, 255))
+            else:
+                cv2.rectangle(frame, (x, y0), (x + swatch, y0 + swatch), (70, 70, 70), 1)
 
     @staticmethod
     def _error_frame(message, width=1280, height=480):
