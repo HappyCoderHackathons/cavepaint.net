@@ -63,6 +63,8 @@ tracker.start()
 pcs: set[RTCPeerConnection] = set()
 
 TEMPLATE = (Path(__file__).parent / "templates" / "stream.html").read_text()
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def index(request):
@@ -218,6 +220,7 @@ app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_get("/whiteboard.png", whiteboard)
+app.router.add_static("/static/", STATIC_DIR, show_index=False)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

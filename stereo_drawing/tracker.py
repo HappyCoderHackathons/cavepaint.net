@@ -130,7 +130,7 @@ class StereoDrawingTracker:
     def render_whiteboard(self, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
         width = int(np.clip(width, 320, 1920))
         height = int(np.clip(height, 120, 1080))
-        yaw_deg = float(np.clip(yaw_deg, -85.0, 85.0))
+        yaw_deg = float(yaw_deg) % 360.0
         fov_deg = float(np.clip(fov_deg, 30.0, 150.0))
         yaw_rad = float(np.deg2rad(yaw_deg))
         fov_rad = float(np.deg2rad(fov_deg))
@@ -184,7 +184,7 @@ class StereoDrawingTracker:
 
         cv2.putText(
             board,
-            f"Yaw {yaw_deg:+.1f} deg | FOV {fov_deg:.0f} deg",
+            f"Yaw {yaw_deg:.1f} deg | FOV {fov_deg:.0f} deg",
             (12, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
