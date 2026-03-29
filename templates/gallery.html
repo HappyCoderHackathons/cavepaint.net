@@ -113,7 +113,8 @@
 
     function buildCard(session) {
       const sid = session.session_id;
-      const thumbUrl = `/api/sessions/${encodeURIComponent(sid)}/frame?t=999999&w=480&h=160`;
+      // Request a higher-resolution 3:1 frame so downscaling keeps strokes crisp.
+      const thumbUrl = `/api/sessions/${encodeURIComponent(sid)}/frame?t=999999&w=960&h=320`;
 
       const card = document.createElement("a");
       card.href = `/replay/${encodeURIComponent(sid)}`;
@@ -124,12 +125,12 @@
       ].join(" ");
 
       card.innerHTML = `
-        <div class="relative overflow-hidden bg-[#f5ede0]" style="height:160px;">
+        <div class="relative aspect-[3/1] overflow-hidden bg-[#f5ede0]">
           <img
             src="${thumbUrl}"
             alt="Session thumbnail"
             loading="lazy"
-            class="h-full w-full object-fill transition duration-300 group-hover:scale-[1.02]"
+            class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.02]"
             draggable="false"
           >
           <div class="pointer-events-none absolute inset-x-0 bottom-0 h-8

@@ -194,7 +194,10 @@ class SessionStore:
                         min_radius=SessionStore._min_r(max_r),
                     )
                     active[key] = stroke
-                stroke.add(event["x"], event["y"], event["z"])
+                # Replay stored points exactly as captured so stroke smoothing and
+                # speed-based width match the live render path.
+                stroke.pts.append((event["x"], event["y"], event["z"]))
+                stroke.times.append(float(event["t"]))
             elif event["kind"] == "erase":
                 for s in active.values():
                     if not s.empty():
