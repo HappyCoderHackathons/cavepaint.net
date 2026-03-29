@@ -220,10 +220,13 @@
 
     window.addEventListener("resize", markBoardDirty);
 
+    const WHITEBOARD_REFRESH_MS = 180;
+
     setInterval(() => {
+      if (document.hidden) return;
       boardDirty = true;
       refreshWhiteboard();
-    }, 120);
+    }, WHITEBOARD_REFRESH_MS);
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }]

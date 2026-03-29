@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import mediapipe as mp
@@ -29,6 +30,7 @@ from pymongo.errors import PyMongoError
 import os
 from dotenv import load_dotenv
 
+from mongo_whiteboard import MongoWhiteboardReplay
 from stroke import Stroke, StrokeStore
 from triangulate import depth_inches_to_str, triangulate
 from swipe_detect import SwipeDetector
@@ -69,6 +71,19 @@ _INPUT_DIM = 63 + 15  # 21 landmarks × 3 coords + 15 distance features
 
 load_dotenv()
 uri = os.getenv("MONGO_URI")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+WHITEBOARD_DB_REFRESH_MS = _env_int("WHITEBOARD_DB_REFRESH_MS", 250)
 drawings_col = None
 points_col = None
 erases_col = None
@@ -81,6 +96,9 @@ if uri:
         points_col = db["points"]
         erases_col = db["erases"]
         client.admin.command("ping")
+        drawings_col.create_index([("sessionId", 1), ("createdAt", 1)])
+        points_col.create_index([("sessionId", 1), ("_id", 1)])
+        erases_col.create_index([("sessionId", 1), ("_id", 1)])
     except Exception as exc:
         print(f"[mongo] Disabled (connection failed): {exc}")
         drawings_col = None
@@ -244,14 +262,34 @@ class StereoDrawingTracker:
         self.thread = None
         self._active_drawing_id = None
         self._seq = 0
+        self._session_id = uuid4().hex
         self._mongo_enabled = drawings_col is not None and points_col is not None
+        self._mongo_whiteboard = (
+            MongoWhiteboardReplay(
+                points_col=points_col,
+                erases_col=erases_col,
+                session_id=self._session_id,
+                refresh_interval_ms=WHITEBOARD_DB_REFRESH_MS,
+            )
+            if points_col is not None and erases_col is not None
+            else None
+        )
         self._color_idx = 0
+        print(f"[session] Drawing session: {self._session_id}")
 
     @staticmethod
     def _utcnow():
         return datetime.now(timezone.utc)
 
-    def _start_drawing_doc(self):
+    @staticmethod
+    def _serialize_color(color):
+        if isinstance(color, (list, tuple)) and len(color) == 3:
+            return [int(max(0, min(255, c))) for c in color]
+        if isinstance(color, str):
+            return color
+        return "black"
+
+    def _start_drawing_doc(self, color="black"):
         if not self._mongo_enabled:
             return
         now = self._utcnow()
@@ -261,8 +299,9 @@ class StereoDrawingTracker:
             "endedAt": None,
             "status": "active",
             "pointCount": 0,
-            "color": "black",
+            "color": self._serialize_color(color),
             "rigRotationDeg": 0,
+            "sessionId": self._session_id,
         }
         try:
             result = drawings_col.insert_one(doc)
@@ -272,7 +311,7 @@ class StereoDrawingTracker:
             print(f"[mongo] drawing insert failed: {exc}")
             self._active_drawing_id = None
 
-    def _insert_point_doc(self, x, y, z):
+    def _insert_point_doc(self, x, y, z, color="black"):
         if not self._mongo_enabled or self._active_drawing_id is None:
             return
         point_doc = {
@@ -281,7 +320,8 @@ class StereoDrawingTracker:
             "t": self._utcnow(),
             "position": {"x": float(x), "y": float(y), "z": float(z)},
             "rigRotationDeg": 0,
-            "color": "black",
+            "color": self._serialize_color(color),
+            "sessionId": self._session_id,
         }
         try:
             points_col.insert_one(point_doc)
@@ -289,14 +329,16 @@ class StereoDrawingTracker:
         except PyMongoError as exc:
             print(f"[mongo] point insert failed: {exc}")
 
-    def _insert_erase_doc(self, x, y, radius):
+    def _insert_erase_doc(self, x, y, radius, z=0.0):
         if erases_col is None:
             return
         erase_doc = {
             "x": float(x),
             "y": float(y),
+            "z": float(z),
             "radius": float(radius),
             "t": self._utcnow(),
+            "sessionId": self._session_id,
         }
         if self._active_drawing_id is not None:
             erase_doc["drawingId"] = self._active_drawing_id
@@ -383,6 +425,29 @@ class StereoDrawingTracker:
             strokes.append(dst)
         return strokes
 
+    @staticmethod
+    def _project_erase_radius(
+        x: float,
+        y: float,
+        z: float,
+        radius: float,
+        yaw_rad: float,
+        fov_rad: float,
+        width: int,
+        height: int,
+    ) -> int:
+        c0 = StereoDrawingTracker._project_whiteboard_point(
+            x, y, z, yaw_rad, fov_rad, width, height
+        )
+        c1 = StereoDrawingTracker._project_whiteboard_point(
+            x + float(radius), y, z, yaw_rad, fov_rad, width, height
+        )
+        if c0 is not None and c1 is not None:
+            r = int(np.hypot(c1[0] - c0[0], c1[1] - c0[1]))
+            return max(1, r)
+        # Fallback scale from original camera width (640px).
+        return max(1, int(float(radius) * (float(width) / 640.0)))
+
     def render_whiteboard(self, yaw_deg=0.0, fov_deg=80.0, width=960, height=260):
         width = int(np.clip(width, 320, 1920))
         height = int(np.clip(height, 120, 1080))
@@ -391,20 +456,39 @@ class StereoDrawingTracker:
         yaw_rad = float(np.deg2rad(yaw_deg))
         fov_rad = float(np.deg2rad(fov_deg))
 
-        with self.lock:
-            strokes = self._snapshot_strokes()
+        ops = None
+        if self._mongo_whiteboard is not None:
+            ops = self._mongo_whiteboard.load_state()
 
-        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        if ops is None:
+            with self.lock:
+                ops = [{"kind": "stroke", "stroke": s} for s in self._snapshot_strokes()]
 
         def project(px, py, pz):
             return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, width, height)
 
-        for stroke in strokes:
-            stroke.render(canvas, project=project)
-
         board = np.full((height, width, 3), 255, dtype=np.uint8)
-        mask = canvas.any(axis=2)
-        board[mask] = canvas[mask]
+        for op in ops:
+            if op.get("kind") == "stroke":
+                stroke = op.get("stroke")
+                if stroke is not None:
+                    stroke.render(board, project=project)
+                continue
+
+            if op.get("kind") == "erase":
+                cx = float(op.get("x", 0.0))
+                cy = float(op.get("y", 0.0))
+                cz = float(op.get("z", 0.0))
+                cr = float(op.get("radius", 30.0))
+                center = self._project_whiteboard_point(
+                    cx, cy, cz, yaw_rad, fov_rad, width, height
+                )
+                if center is None:
+                    continue
+                draw_r = self._project_erase_radius(
+                    cx, cy, cz, cr, yaw_rad, fov_rad, width, height
+                )
+                cv2.circle(board, center, draw_r, (255, 255, 255), -1, cv2.LINE_AA)
 
         cv2.putText(
             board,
@@ -573,14 +657,22 @@ class StereoDrawingTracker:
                                     self._finish_drawing_doc(status="completed")
                                 erase_radius = 30
                                 self._strokes.erase_near(tip0[0], tip0[1], radius=erase_radius)
-                                self._insert_erase_doc(tip0[0], tip0[1], erase_radius)
+                                self._insert_erase_doc(tip0[0], tip0[1], erase_radius, z)
                                 self._was_drawing = False
                             elif drawing and tip0:
                                 if not self._was_drawing:
-                                    self._strokes.begin(color=PALETTE[self._color_idx])
-                                    self._start_drawing_doc()
+                                    active_color = PALETTE[self._color_idx]
+                                    self._strokes.begin(color=active_color)
+                                    self._start_drawing_doc(color=active_color)
+
+                                active = self._strokes._active
+                                before_len = len(active.pts) if active is not None else 0
                                 self._strokes.add_point(tip0[0], tip0[1], z)
-                                self._insert_point_doc(tip0[0], tip0[1], z)
+
+                                active = self._strokes._active
+                                if active is not None and len(active.pts) > before_len:
+                                    sx, sy, sz = active.pts[-1]
+                                    self._insert_point_doc(sx, sy, sz, color=active.color)
                                 self._was_drawing = True
                             else:
                                 if self._was_drawing:
