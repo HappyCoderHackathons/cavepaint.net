@@ -5,6 +5,7 @@ import math
 import os
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ from .constants import (
     SWIPE_MODEL_PATH,
     _PALM_INDICES,
 )
-from .gesture import GestureClassifier
+from .gesture import GestureClassifier, classify_rule_gesture
 from .landmarker import (detect, draw_hand, make_landmarker,
                          make_pose_landmarker, detect_pose, get_segmentation_mask)
 from .mongo import WHITEBOARD_DB_REFRESH_MS, actions_col, drawings_col, erases_col, points_col
@@ -874,6 +875,8 @@ class StereoDrawingTracker:
                             pose_lm0=pose_lm0, pose_lm1=pose_lm1,
                         )
             except Exception as exc:
+                print(f"[tracker] processing loop error: {exc}")
+                traceback.print_exc()
                 with self.lock:
                     self.output_frame = self._error_frame(f"Stereo tracker error: {exc}")
         finally:
@@ -929,8 +932,13 @@ class StereoDrawingTracker:
         if GESTURE_MODEL_PATH.exists() and GESTURE_META_PATH.exists():
             try:
                 return GestureClassifier()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[gesture] classifier disabled: {exc}")
+        else:
+            print(
+                f"[gesture] classifier disabled: missing files "
+                f"(model={GESTURE_MODEL_PATH.exists()}, meta={GESTURE_META_PATH.exists()})"
+            )
         return None
 
     def _load_swipe_detector(self):
@@ -1006,6 +1014,8 @@ class StereoDrawingTracker:
 
             tip0 = tip1 = tip8 = tip12 = None
             gesture = None
+            conf = None
+            gesture_source = None
             if res0.hand_landmarks:
                 hand = res0.hand_landmarks[0]
                 tip0 = draw_hand(frame0, hand, w, h)
@@ -1015,9 +1025,19 @@ class StereoDrawingTracker:
                 tip8 = hand[8]
                 tip12 = hand[12]
                 if gesture_clf:
-                    gesture, conf = gesture_clf.classify(hand)
-                    if conf < GESTURE_CONFIDENCE:
-                        gesture = None
+                    ml_gesture, ml_conf = gesture_clf.classify(hand)
+                    conf = float(ml_conf)
+                    if ml_conf >= GESTURE_CONFIDENCE:
+                        gesture = ml_gesture
+                        gesture_source = "ml"
+                # Fallback to deterministic geometry when ML confidence is too low
+                # or classifier unavailable.
+                if gesture is None:
+                    rule_gesture, rule_score = classify_rule_gesture(hand)
+                    if rule_gesture is not None:
+                        gesture = rule_gesture
+                        conf = float(rule_score)
+                        gesture_source = "rule"
             if res1.hand_landmarks:
                 tip1 = draw_hand(frame1, res1.hand_landmarks[0], w, h)
 
@@ -1145,7 +1165,12 @@ class StereoDrawingTracker:
                 wl = pose_res0.pose_world_landmarks[0]
                 shoulder_world_z = (wl[11].z + wl[12].z) / 2
                 hand_world_z = min(wl[15].z, wl[16].z)  # forward-most wrist
-            z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
+            # In single-camera mode we keep drawing in a flat Z plane.
+            # This avoids unstable pseudo-depth from pose-only estimates.
+            if single_cam:
+                z = 0.0
+            else:
+                z = hand_world_z if hand_world_z is not None else (pos3d[2] if pos3d else 0.0)
 
             with self.lock:
                 live_yaw_deg = float(self._live_yaw_deg) % 360.0
@@ -1156,9 +1181,10 @@ class StereoDrawingTracker:
                 if use_projected_live:
                     yaw_rad = float(np.deg2rad(live_yaw_deg))
                     fov_rad = float(np.deg2rad(live_fov_deg))
+                    theta_deg = float(self._theta)
 
                     def live_project(px, py, pz):
-                        return self._project_whiteboard_point(px, py, pz, yaw_rad, fov_rad, w, h)
+                        return self._project_whiteboard_point(px, py, pz, theta_deg, yaw_rad, fov_rad, w, h)
 
                 if submit_swipe_up:
                     self._submit_and_start_new_session()
@@ -1295,6 +1321,9 @@ class StereoDrawingTracker:
                     "tip1": list(tip1) if tip1 else None,
                     "pos3d": [round(v, 2) for v in pos3d] if pos3d else None,
                     "gesture": gesture,
+                    "gesture_conf": round(conf, 3) if conf is not None else None,
+                    "gesture_model_loaded": bool(gesture_clf),
+                    "gesture_source": gesture_source,
                     "fps": round(_fps, 1),
                     "brush_radius": self._strokes.current_radius,
                     "live_yaw": round(live_yaw_deg, 1),

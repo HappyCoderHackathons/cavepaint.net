@@ -1,16 +1,19 @@
+import base64
 import asyncio
 import json
+import mimetypes
 import os
 import time
 from fractions import Fraction
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 import av
 import cv2
 import numpy as np
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 
 from stereo_drawing import PALETTE, StereoDrawingTracker, find_cameras
@@ -82,6 +85,111 @@ session_store = (
     if drawings_col is not None
     else None
 )
+
+_DEFAULT_REPLAY_PROMPT = (
+    "Narrate this cave drawing frame in cinematic present tense. "
+    "Keep it concise, vivid, and suitable for live playback commentary."
+)
+
+
+def _narration_chat_base_url() -> str:
+    base = (
+        os.getenv("NARRATION_API_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("OPENAI_API_BASE")
+        or "https://api.openai.com/v1"
+    )
+    base = base.strip()
+    if not base.startswith("http://") and not base.startswith("https://"):
+        base = f"https://{base}"
+    base = base.rstrip("/")
+    # Accept either ".../chat/completions" or API base forms.
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")]
+    idx = base.find("/chat/completions")
+    if idx != -1:
+        return base[:idx]
+    return base
+
+
+def _narration_api_key() -> str | None:
+    return (
+        os.getenv("NARRATION_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPENAI_TOKEN")
+    )
+
+
+def _to_data_uri_from_image_url(image_url: str, max_bytes: int = 8_000_000) -> str:
+    src = (image_url or "").strip()
+    if not src:
+        raise ValueError("image_url is required")
+    if src.startswith("data:"):
+        return src
+
+    parsed = urlparse(src)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("image_url must start with http:// or https://")
+
+    req = Request(src, headers={"User-Agent": "cavepaint-net/1.0"})
+    with urlopen(req, timeout=15) as resp:
+        raw = resp.read(max_bytes + 1)
+        mime = ""
+        if hasattr(resp.headers, "get_content_type"):
+            mime = resp.headers.get_content_type() or ""
+        if not mime:
+            mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+
+    if len(raw) > max_bytes:
+        raise ValueError("image_url payload is too large (max 8MB)")
+
+    if not mime or mime == "application/octet-stream":
+        guessed, _ = mimetypes.guess_type(src)
+        mime = guessed or "image/jpeg"
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _extract_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for item in content:
+            if isinstance(item, str):
+                out.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            txt = item.get("text")
+            if isinstance(txt, str):
+                out.append(txt)
+        return "".join(out)
+    return ""
+
+
+def _extract_openai_delta_text(payload: dict) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    return _extract_text_from_content(delta.get("content"))
+
+
+def _extract_openai_message_text(payload: dict) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    return _extract_text_from_content(msg.get("content"))
+
+
+async def _sse_write(response: web.StreamResponse, event: str, data: dict):
+    try:
+        await response.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+    except ConnectionResetError:
+        pass
 
 
 async def index(request):
@@ -209,6 +317,200 @@ async def set_live_view(request):
 
     tracker.set_live_view(yaw_deg=yaw, fov_deg=fov)
     return web.Response(status=204)
+
+
+async def replay_narrate_stream(request):
+    response = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await response.prepare(request)
+
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        await _sse_write(response, "error", {"error": "Expected JSON body"})
+        await response.write_eof()
+        return response
+
+    image_url = str(data.get("image_url") or "").strip()
+    prompt = str(data.get("prompt") or _DEFAULT_REPLAY_PROMPT).strip()
+    try:
+        temperature = float(data.get("temperature", 0.8))
+    except (TypeError, ValueError):
+        temperature = 0.8
+    temperature = max(0.0, min(2.0, temperature))
+
+    if not image_url:
+        await _sse_write(response, "error", {"error": "image_url is required"})
+        await response.write_eof()
+        return response
+
+    base_url = _narration_chat_base_url()
+    token = _narration_api_key()
+    if not base_url or not token:
+        await _sse_write(
+            response,
+            "error",
+            {
+                "error": (
+                    "Set NARRATION_API_KEY (or OPENAI_API_KEY). "
+                    "Optional: set NARRATION_API_BASE_URL (defaults to https://api.openai.com/v1)."
+                )
+            },
+        )
+        await response.write_eof()
+        return response
+
+    preferred_model = str(
+        data.get("model")
+        or os.getenv("NARRATION_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "gpt-4o-mini"
+    ).strip()
+    fallback_model = str(
+        os.getenv("NARRATION_FALLBACK_MODEL")
+        or os.getenv("OPENAI_FALLBACK_MODEL")
+        or ""
+    ).strip()
+    models_to_try = [preferred_model]
+    if fallback_model and fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
+
+    try:
+        image_data_uri = await asyncio.to_thread(_to_data_uri_from_image_url, image_url)
+    except Exception as exc:
+        await _sse_write(response, "error", {"error": f"Failed to fetch image_url: {exc}"})
+        await response.write_eof()
+        return response
+
+    endpoint = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    timeout = ClientTimeout(total=180)
+
+    async with ClientSession(timeout=timeout) as session:
+        for idx, model_name in enumerate(models_to_try):
+            req_body = {
+                "model": model_name,
+                "stream": True,
+                "temperature": temperature,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a live cave-art narrator for replay mode. "
+                            "Describe the frame as a short unfolding story."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_data_uri}},
+                        ],
+                    },
+                ],
+            }
+
+            try:
+                async with session.post(endpoint, headers=headers, json=req_body) as upstream:
+                    if upstream.status >= 400:
+                        detail = await upstream.text()
+                        is_unknown_model = "unknown model" in detail.lower()
+                        if is_unknown_model and idx < len(models_to_try) - 1:
+                            continue
+                        hint = None
+                        if upstream.status == 404 and "<!doctype html>" in detail.lower():
+                            hint = (
+                                "The narration base URL looks like a web page, not an API base. "
+                                "For OpenAI, use NARRATION_API_BASE_URL=https://api.openai.com/v1"
+                            )
+                        if upstream.status in (401, 403) and hint is None:
+                            hint = (
+                                "Check your narration API key and model access. "
+                                "For OpenAI, verify OPENAI_API_KEY and that the model is enabled."
+                            )
+                        await _sse_write(
+                            response,
+                            "error",
+                            {
+                                "error": f"Narration request failed ({upstream.status})",
+                                "detail": detail[:800],
+                                "model": model_name,
+                                "endpoint": endpoint,
+                                "hint": hint,
+                            },
+                        )
+                        await response.write_eof()
+                        return response
+
+                    ctype = (upstream.headers.get("Content-Type") or "").lower()
+                    if "text/event-stream" in ctype:
+                        pending = ""
+                        async for chunk in upstream.content.iter_chunked(4096):
+                            pending += chunk.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+                            boundary = pending.find("\n\n")
+                            while boundary != -1:
+                                block = pending[:boundary]
+                                pending = pending[boundary + 2:]
+                                payload_txt = None
+                                for line in block.split("\n"):
+                                    if line.startswith("data:"):
+                                        payload_txt = line[5:].strip()
+                                        break
+                                if not payload_txt:
+                                    boundary = pending.find("\n\n")
+                                    continue
+                                if payload_txt == "[DONE]":
+                                    await _sse_write(response, "done", {"model": model_name, "endpoint": endpoint})
+                                    await response.write_eof()
+                                    return response
+                                try:
+                                    payload = json.loads(payload_txt)
+                                except json.JSONDecodeError:
+                                    boundary = pending.find("\n\n")
+                                    continue
+                                text = _extract_openai_delta_text(payload)
+                                if text:
+                                    await _sse_write(response, "delta", {"text": text, "model": model_name})
+                                boundary = pending.find("\n\n")
+
+                        if pending.strip():
+                            try:
+                                payload = json.loads(pending.strip().removeprefix("data:").strip())
+                                text = _extract_openai_delta_text(payload)
+                                if text:
+                                    await _sse_write(response, "delta", {"text": text, "model": model_name})
+                            except json.JSONDecodeError:
+                                pass
+
+                        await _sse_write(response, "done", {"model": model_name, "endpoint": endpoint})
+                        await response.write_eof()
+                        return response
+
+                    # Fallback for non-streaming JSON responses.
+                    payload = await upstream.json(content_type=None)
+                    text = _extract_openai_message_text(payload)
+                    if text:
+                        await _sse_write(response, "delta", {"text": text, "model": model_name})
+                    await _sse_write(response, "done", {"model": model_name, "endpoint": endpoint})
+                    await response.write_eof()
+                    return response
+            except Exception as exc:
+                if idx < len(models_to_try) - 1:
+                    continue
+                await _sse_write(response, "error", {"error": f"Narration upstream error: {exc}"})
+                await response.write_eof()
+                return response
+
+    await _sse_write(response, "error", {"error": "No compatible narration model succeeded"})
+    await response.write_eof()
+    return response
 
 
 async def mouse_stroke(request):
@@ -386,6 +688,7 @@ app.router.add_get("/state", state)
 app.router.add_get("/stream", stream_state)
 app.router.add_post("/color", set_color)
 app.router.add_post("/live_view", set_live_view)
+app.router.add_post("/api/replay/narrate_stream", replay_narrate_stream)
 app.router.add_post("/stroke", mouse_stroke)
 app.router.add_get("/whiteboard.png", whiteboard)
 app.router.add_get("/whiteboard.jpg", whiteboard_jpg)
