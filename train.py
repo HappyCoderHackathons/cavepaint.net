@@ -72,6 +72,15 @@ def compute_features(raw_coords: np.ndarray) -> np.ndarray:
 
 
 def load_splits(csv_paths):
+    dfs= []
+    for p in csv_paths:
+        "Checks if dataframe is empty to prevent errors"
+        if not p:
+            continue
+        data = pd.read_csv(p)
+        print(data)
+        dfs.append(data)
+    
     df = pd.concat([pd.read_csv(p) for p in csv_paths], ignore_index=True)
     df = df[df["gesture"].isin(GESTURES)].copy()
     g2i = {g: i for i, g in enumerate(GESTURES)}
