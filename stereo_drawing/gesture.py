@@ -79,3 +79,57 @@ class GestureClassifier:
             probs = torch.softmax(self.model(x), dim=1)
             conf, idx = probs.max(1)
         return self.gestures[idx.item()], conf.item()
+
+
+def classify_rule_gesture(landmarks) -> tuple[str | None, float]:
+    """Lightweight geometric fallback when ML confidence is too low.
+
+    Returns (gesture_name, confidence_like_score in [0,1]).
+    """
+    coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
+    if coords.shape != (21, 3):
+        return None, 0.0
+
+    wrist = coords[0]
+
+    def is_extended(tip_idx: int, pip_idx: int, ratio: float) -> bool:
+        tip_d = float(np.linalg.norm(coords[tip_idx] - wrist))
+        pip_d = float(np.linalg.norm(coords[pip_idx] - wrist))
+        return tip_d > max(1e-6, pip_d * ratio)
+
+    thumb = is_extended(4, 3, 1.05)
+    index = is_extended(8, 6, 1.12)
+    middle = is_extended(12, 10, 1.12)
+    ring = is_extended(16, 14, 1.12)
+    pinky = is_extended(20, 18, 1.12)
+
+    def score(parts: list[bool]) -> float:
+        return float(sum(1 for p in parts if p)) / float(len(parts))
+
+    # Keep ordering aligned with interactive use priorities.
+    # point: index only
+    point_s = score([index, not middle, not ring, not pinky])
+    if point_s >= 0.85 and index:
+        return "point", point_s
+
+    # peace: index + middle
+    peace_s = score([index, middle, not ring, not pinky])
+    if peace_s >= 0.85 and index and middle:
+        return "peace", peace_s
+
+    # gun: thumb + index
+    gun_s = score([thumb, index, not middle, not ring, not pinky])
+    if gun_s >= 0.90 and thumb and index:
+        return "gun", gun_s
+
+    # fist: no fingers extended
+    fist_s = score([not index, not middle, not ring, not pinky])
+    if fist_s >= 0.90:
+        return "fist", fist_s
+
+    # open hand: most fingers extended
+    ext_count = int(thumb) + int(index) + int(middle) + int(ring) + int(pinky)
+    if ext_count >= 4:
+        return "open_hand", ext_count / 5.0
+
+    return None, 0.0

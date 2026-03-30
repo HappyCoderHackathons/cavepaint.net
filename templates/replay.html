@@ -126,6 +126,45 @@
 
       <div class="ml-auto text-[11px] text-orange-100/35" id="strokeInfo"></div>
     </div>
+
+    <div class="mt-3 rounded-lg border border-stone-700/50 bg-cave0/45 p-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <input
+          id="narrImageUrl"
+          type="url"
+          placeholder="Optional image URL (defaults to final drawing frame)"
+          class="min-w-[260px] flex-1 rounded-md border border-stone-400/25 bg-cave0/65 px-3 py-2 text-xs text-chalk placeholder:text-orange-100/35 focus:outline-none"
+        >
+        <button
+          id="narrateBtn"
+          class="rounded-full border border-ember/40 bg-gradient-to-b from-[#8c6040] to-[#4a3020] px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-100 transition hover:brightness-110"
+        >
+          Narrate Frame
+        </button>
+        <button
+          id="stopNarrateBtn"
+          class="rounded-full border border-stone-200/20 bg-gradient-to-b from-[#656565] to-[#3b3b3b] px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-stone-100 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45"
+          disabled
+        >
+          Stop
+        </button>
+      </div>
+
+      <textarea
+        id="narrPrompt"
+        rows="2"
+        class="mt-2 w-full resize-y rounded-md border border-stone-400/25 bg-cave0/65 px-3 py-2 text-xs text-chalk placeholder:text-orange-100/35 focus:outline-none"
+        placeholder="Optional prompt (e.g., 'Tell this like an ancient myth unfolding scene by scene.')"
+      ></textarea>
+
+      <p id="narrStatus" class="mt-2 text-[11px] text-orange-100/65">
+        Narrator idle.
+      </p>
+      <pre
+        id="narrOutput"
+        class="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-stone-600/45 bg-cave0/70 p-3 text-xs leading-relaxed text-orange-50/95"
+      ></pre>
+    </div>
   </div>
 
   <script>
@@ -144,6 +183,12 @@
     const fovRange       = document.getElementById("fovRange");
     const fovValue       = document.getElementById("fovValue");
     const yawReadout     = document.getElementById("yawReadout");
+    const narrImageUrl   = document.getElementById("narrImageUrl");
+    const narrPrompt     = document.getElementById("narrPrompt");
+    const narrateBtn     = document.getElementById("narrateBtn");
+    const stopNarrateBtn = document.getElementById("stopNarrateBtn");
+    const narrStatus     = document.getElementById("narrStatus");
+    const narrOutput     = document.getElementById("narrOutput");
 
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
     const wrap360 = v => { const w = v % 360; return w < 0 ? w + 360 : w; };
@@ -165,6 +210,8 @@
     let rafId      = null;
     let lastRafTs  = null;
     let scrubbing  = false;
+    let narrController = null;
+    let narrSseBuffer = "";
 
     // --- frame fetching -------------------------------------------------------
 
@@ -302,6 +349,137 @@
       fovValue.textContent = Math.round(fov) + "°";
       yawReadout.textContent = wrap360(yaw).toFixed(1) + "°";
     }
+
+    function buildNarrationFrameUrl() {
+      const rect = boardSurface.getBoundingClientRect();
+      const w = Math.max(320, Math.round(rect.width));
+      const h = Math.max(120, Math.round(rect.height));
+      // Narration should describe the completed drawing, not the current playback frame.
+      const finalT = duration > 0 ? duration : t;
+      const rel = `/api/sessions/${encodeURIComponent(sessionId)}/frame`
+        + `?t=${finalT.toFixed(2)}&yaw=${wrap360(yaw).toFixed(2)}&fov=${fov.toFixed(1)}&w=${w}&h=${h}&ts=${Date.now()}`;
+      return `${location.origin}${rel}`;
+    }
+
+    function setNarrStatus(msg, isError = false) {
+      narrStatus.textContent = msg;
+      narrStatus.className = isError
+        ? "mt-2 text-[11px] text-red-300"
+        : "mt-2 text-[11px] text-orange-100/65";
+    }
+
+    function appendNarrText(text) {
+      if (!text) return;
+      narrOutput.textContent += text;
+      narrOutput.scrollTop = narrOutput.scrollHeight;
+    }
+
+    function consumeNarrBlock(block) {
+      if (!block.trim()) return;
+      let eventType = "message";
+      const dataLines = [];
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith("event:")) eventType = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      const dataRaw = dataLines.join("");
+      if (!dataRaw) return;
+
+      let payload;
+      try {
+        payload = JSON.parse(dataRaw);
+      } catch (_) {
+        payload = { text: dataRaw };
+      }
+
+      if (eventType === "delta") {
+        appendNarrText(payload.text || "");
+      } else if (eventType === "done") {
+        setNarrStatus(`Narration complete (${payload.model || "model"}).`);
+      } else if (eventType === "error") {
+        const detail = payload.detail ? ` (${payload.detail})` : "";
+        const hint = payload.hint ? ` Hint: ${payload.hint}` : "";
+        setNarrStatus(`${payload.error || "Narration failed"}${detail}${hint}`, true);
+      }
+    }
+
+    function stopNarration() {
+      if (!narrController) return;
+      narrController.abort();
+      narrController = null;
+      setNarrStatus("Narration stopped.");
+      narrateBtn.disabled = false;
+      stopNarrateBtn.disabled = true;
+    }
+
+    async function startNarration() {
+      if (!sessionId) return;
+      if (narrController) stopNarration();
+
+      const imageUrl = (narrImageUrl.value || "").trim() || buildNarrationFrameUrl();
+      const prompt = (narrPrompt.value || "").trim();
+
+      const controller = new AbortController();
+      narrController = controller;
+      narrSseBuffer = "";
+      narrOutput.textContent = "";
+      setNarrStatus("Connecting to narrator API…");
+      narrateBtn.disabled = true;
+      stopNarrateBtn.disabled = false;
+
+      try {
+        const resp = await fetch("/api/replay/narrate_stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                image_url: imageUrl,
+                prompt,
+              }),
+          signal: controller.signal,
+        });
+
+        if (!resp.ok || !resp.body) {
+          const msg = await resp.text();
+          throw new Error(msg || `HTTP ${resp.status}`);
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        setNarrStatus("Narration streaming…");
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          narrSseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+          let boundary = narrSseBuffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const block = narrSseBuffer.slice(0, boundary);
+            narrSseBuffer = narrSseBuffer.slice(boundary + 2);
+            consumeNarrBlock(block);
+            boundary = narrSseBuffer.indexOf("\n\n");
+          }
+        }
+
+        if (narrSseBuffer.trim()) {
+          consumeNarrBlock(narrSseBuffer);
+          narrSseBuffer = "";
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          // stopNarration already set status
+        } else {
+          setNarrStatus(`Narration error: ${err.message || err}`, true);
+        }
+      } finally {
+        if (narrController === controller) narrController = null;
+        narrateBtn.disabled = false;
+        stopNarrateBtn.disabled = true;
+      }
+    }
+
+    narrateBtn.addEventListener("click", startNarration);
+    stopNarrateBtn.addEventListener("click", stopNarration);
+    window.addEventListener("beforeunload", stopNarration);
 
     // --- init -----------------------------------------------------------------
 

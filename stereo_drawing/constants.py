@@ -11,7 +11,11 @@ SWIPE_MODEL_PATH   = Path(__file__).parent.parent / "swipe_model.pth"
 SWIPE_META_PATH    = Path(__file__).parent.parent / "swipe_meta.json"
 
 INDEX_FINGERTIP    = 8
-GESTURE_CONFIDENCE = 0.5
+try:
+    GESTURE_CONFIDENCE = float(os.getenv("GESTURE_CONFIDENCE", "0.5"))
+except ValueError:
+    GESTURE_CONFIDENCE = 0.5
+GESTURE_CONFIDENCE = max(0.0, min(1.0, GESTURE_CONFIDENCE))
 SWIPE_DISPLAY_FRAMES = 35  # how long a swipe label stays on screen (~1 s)
 
 # When false, disable "3D person" silhouette alpha compositing and

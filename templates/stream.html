@@ -679,7 +679,12 @@
       hudTip0.textContent = `TIP0 ${fmtPx(t.tip0)}`;
       hudTip1.textContent = `TIP1 ${fmtPx(t.tip1)}`;
       hudXyz.textContent  = `XYZ  ${fmtXyz(t.pos3d)} in`;
-      hudHand.textContent  = `HAND  ${t.gesture ?? "—"}`;
+      const handLabel = t.gesture
+        ? (t.gesture_conf != null
+            ? `${t.gesture} (${t.gesture_conf.toFixed(2)}${t.gesture_source ? ` ${t.gesture_source}` : ""})`
+            : t.gesture)
+        : (t.gesture_model_loaded === false ? "model-missing" : "—");
+      hudHand.textContent  = `HAND  ${handLabel}`;
       hudBrush.textContent = `BRUSH ${t.brush_radius ?? "—"}px`;
       hudFps.textContent   = `FPS   ${t.fps ?? "—"}`;
 
