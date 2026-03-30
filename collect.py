@@ -2,8 +2,8 @@
 
 Usage:
     uv run collect.py
-    uv run collect.py -g open_hand point   # specific gestures only
-    uv run collect.py -c 3                 # 3 cycles instead of default 5
+    uv run collect.py -g spread_fingers point   # specific gestures only
+    uv run collect.py -c 3                      # 3 cycles instead of default 5
 """
 
 import argparse
@@ -20,11 +20,11 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-GESTURES = ["open_hand", "point", "fist", "peace", "gun"]
-CYCLES = 5
+GESTURES = ["spread_fingers", "point", "fist", "peace"]
+CYCLES = 3
 COUNTDOWN_SECONDS = 3
 RECORD_SECONDS = 8
-PAUSE_SECONDS = 2
+PAUSE_SECONDS = 3
 
 HAND_MODEL_PATH = Path("hand_landmarker.task")
 
@@ -53,9 +53,10 @@ def parse_args():
 def normalize_landmarks(raw):
     wrist = np.array(raw[0])
     translated = [np.array(p) - wrist for p in raw]
-    max_dist = max(np.linalg.norm(t) for t in translated[1:])
-    if max_dist < 1e-6:
-        return translated
+    # Only use non-wrist points that have meaningful distance for scale calculation
+    # This handles 4-finger hands where some landmarks may be near-zero/interpolated
+    valid = [t for t in translated[1:] if np.linalg.norm(t) > 1e-6]
+    max_dist = max((np.linalg.norm(t) for t in valid), default=1.0)
     return [t / max_dist for t in translated]
 
 
@@ -87,8 +88,11 @@ def main():
         base_options=BaseOptions(model_asset_path=str(HAND_MODEL_PATH)),
         running_mode=RunningMode.VIDEO,
         num_hands=1,
-        min_hand_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
+        # Lowered thresholds so non-standard hand shapes (e.g. 4-finger hands)
+        # are still reliably detected and tracked
+        min_hand_detection_confidence=0.5,  # was 0.7
+        min_hand_presence_confidence=0.5,   # added
+        min_tracking_confidence=0.3,        # was 0.5
     )
 
     cap = cv2.VideoCapture(0)
@@ -148,11 +152,17 @@ def main():
                             for pt in pts.values():
                                 cv2.circle(frame, pt, 4, (0, 0, 255), -1)
 
-                        # Record
+                        # Record — accept any non-empty landmark result;
+                        # removed the strict `len == 21` check so 4-finger
+                        # hands (where MP may return fewer real landmarks) still
+                        # get recorded
                         if phase == Phase.RECORD and result.hand_landmarks:
                             lms = result.hand_landmarks[0]
-                            if len(lms) == 21:
+                            if lms:
                                 raw = [(lm.x, lm.y, lm.z) for lm in lms]
+                                # Pad to 21 entries if MP returned fewer
+                                while len(raw) < 21:
+                                    raw.append((0.0, 0.0, 0.0))
                                 norm = normalize_landmarks(raw)
                                 row = [cycle, gesture, frame_index, f"{time.time():.6f}"]
                                 for x, y, z in raw:
